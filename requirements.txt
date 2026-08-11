@@ -1,0 +1,29 @@
+# Python stack for the Google Neuron project.
+# Install with:  bash setup_env.sh
+#
+# All of these have manylinux wheels for the sandbox (cp310), so the whole
+# install takes ~15 s. Do NOT drop --only-binary=:all: — without it pip will
+# silently fall back to source builds that take many minutes.
+
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.9
+sympy==1.14.0
+
+# Google-native circuit tooling — GridDevice, coupling maps, calibration.
+# The natural choice for step 3 (Willow layout).
+cirq-core==1.5.0
+cirq-google==1.5.0
+
+# Alternative circuit stack + density-matrix / stabiliser noise simulation.
+# Aer is the likely workhorse for step 4.
+qiskit==2.5.1
+qiskit-aer==0.17.2
+
+# NOT INCLUDED: qutip.
+#   No cp310 manylinux wheel is reachable from this sandbox's index, so pip
+#   falls back to a source build which did not complete in >6 minutes.
+#   It is also not needed: our Hilbert spaces are tiny — (2N)^L = 1728 at
+#   L=3, N=6 — so numpy/scipy dense linear algebra is entirely sufficient
+#   and faster to reason about. Revisit only if we need qutip's open-system
+#   solvers (mesolve/mcsolve) for step 4.
