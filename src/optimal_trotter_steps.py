@@ -37,7 +37,7 @@ from neuron_circuit import (
     QutipHamiltonian,
     find_optimal_SpinBosonInteractionCoefficent,
     compute_observables_from_z_expectations,
-    find_low_error_qubit_chain,
+    find_low_error_qubit_embedding,
     map_and_compile_for_willow,
     build_trotter_circuit,
 )
@@ -116,7 +116,7 @@ if not cache_valid:
         cirq_google.engine.load_device_noise_properties(processor_id)
     )
     willow_target_gateset = willow_device.metadata.compilation_target_gatesets[0]
-    willow_qubit_chain = find_low_error_qubit_chain(willow_device, willow_calibration, total_qubits)
+    willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibration, NumberOfFockStates, NumberOfBosonicModes)
     z_observables = [cirq.Z(q) for q in willow_qubit_chain]
 
     # Exact (not sampled) simulators -- isolates the t/steps trade-off from shot noise.

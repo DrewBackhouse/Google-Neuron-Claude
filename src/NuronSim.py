@@ -10,7 +10,7 @@ from neuron_circuit import (
     QutipHamiltonian,
     find_optimal_SpinBosonInteractionCoefficent,
     compute_observables_from_z_expectations,
-    find_low_error_qubit_chain,
+    find_low_error_qubit_embedding,
     map_and_compile_for_willow,
     build_trotter_circuit,
     recommended_trotter_steps,
@@ -207,7 +207,7 @@ willow_target_gateset = willow_device.metadata.compilation_target_gatesets[0]
 
 # Pick a connected, low-error qubit chain matching our L x (N+1) linear topology
 # once — it doesn't depend on dt, only on the circuit's fixed qubit count (D-1).
-willow_qubit_chain = find_low_error_qubit_chain(willow_device, willow_calibration, total_qubits)
+willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibration, NumberOfFockStates, NumberOfBosonicModes)
 print(f"Mapped {total_qubits} logical qubits onto Willow ({processor_id}):")
 print("  " + " - ".join(str(q) for q in willow_qubit_chain))
 

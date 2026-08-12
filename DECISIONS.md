@@ -844,3 +844,209 @@ accuracy, not the same steps at higher per-step cost. Deriving a second-order-sp
 D-18-style schedule (predicted to allow a *later* cap than `t≈8.25`, not an earlier one,
 given the shallower `r*(t)` scaling `O(r^-4)` implies) is flagged as the natural next
 step and not pursued here.
+
+---
+
+## D-21 — Linear Trotter schedule confirmed over quadratic on the real (noisy,
+post-selected) metric; `TROTTER_SCHEDULE_C` revised `4.0` → `2.25`
+
+**Decided (2026-08-12).** Supersedes D-19's schedule constant (not D-18's method of
+using fidelity as a convergence *diagnostic*, which stands). `TROTTER_SCHEDULE_C` in
+`neuron_circuit.py` changes from `4.0` to `2.25`; `TROTTER_SCHEDULE_R_MAX` stays `33`
+(re-verified numerically, unchanged — it's a property of the compiled circuit and
+`willow_pink`'s calibration, not of how `c` is fit); `TROTTER_SCHEDULE_T_CAP` moves from
+`8.25` to `14.67` (`= r_max / c`, algebraic consequence — see caveat below).
+
+**Motivating question.** Standard first-order Trotter error theory (Childs, Su, Tran,
+Wiebe, Zhu, *A Theory of Trotter Error*, PRX 11 011020 — commutator-scaling bound, Eq. 2
+with `p=1`) gives a single formula application over duration `t` error `O(t^2)`; chopping
+total time `T` into `r` steps and summing via the triangle inequality gives total error
+`~O(T^2/r)`. Holding a **fixed** error tolerance as `T` grows therefore requires `r ~ T^2`,
+not `r ~ T`. Yet D-17's own trade-off derivation used exactly this `T^2/r` form and
+produced a **linear** schedule (`r* = t*sqrt(A/B)`), and D-18/D-19 also adopted a linear
+form (`c=4.0`) — fit to `r_T(t)`, defined as a *fixed-tolerance* threshold on noiseless
+fidelity, which by the same theory should have come out quadratic. Raised in
+conversation 2026-08-12 (not itself checked against the paper before D-17); this entry
+resolves it empirically rather than re-deriving further.
+
+**Resolution — these are two different questions, and theory predicts different scaling
+for each.** `r ~ t^2` is the answer to "what `r` holds *Trotter-only* error to a fixed
+tolerance" (D-18/D-19's `r_T(t)`, in principle). `r ~ t` is the answer to "what `r`
+minimizes *total* error when every extra step also costs noise" (D-17's actual
+optimization, `ε_T + ε_N = At^2/r + Br`) — the operationally relevant question here, since
+every Trotter step is a real gate on real (simulated) hardware. D-18/D-19's mistake was
+not the switch to fidelity as a *diagnostic* — it remains a strictly better way to detect
+Trotter-only convergence than D-16/D-17's two-observable metric, immune to the "needle"
+contamination D-17 found (isolated lucky argmin points, 6 of 14). The mistake was using a
+**noiseless** metric to set a schedule meant to also account for noise: fidelity cannot
+see the noise cost of extra steps, so `r_T(t)` will always ask for more depth than is
+actually optimal once post-selection survival is factored in.
+
+**Method — measure both functional forms directly against the metric that matters.**
+Rather than re-deriving `r_T(t)` under a different metric, this entry scans `r=a*t` and
+`r=b*t^2` directly against noisy, post-selected Cirq observable error vs. qutip (D-16/
+D-17's normalized combined-error metric — boson occupation error `/(N-1)`, spin
+magnetization error `/2`, combined in quadrature — RMS'd over a time sweep), which is
+the metric NuronSim.py's actual output is judged on. Two scripts, same model config as
+NuronSim.py's defaults (`L=1, N=5, D=1.0, J=0.5`, matching `_SCHEDULE_CONFIG`):
+
+1. `src/adaptive_trotter_model_scan.py` — coarse scan, `t ∈ [0.5,10]` (20 points, 800
+   shots/point), noise ON + post-selection ON throughout. `a ∈ {0.5,1,2,3,4,6,8,10}`,
+   `b ∈ {0.02,0.05,0.1,0.2,0.3,0.4,0.6,0.8}` (b-range scaled down from a-range so both
+   sweep a comparable step-count range at `t=10`). Outputs in `results/linear trotter/`
+   and `results/quadratic trotter/` (one plot+`.npz` per coefficient, plus a per-model
+   summary), and `results/linear_vs_quadratic_trotter_comparison.png`.
+2. `src/linear_trotter_finegrid_scan.py` — fine scan around the coarse winner,
+   `a ∈ {1.5,1.75,2.0,2.25,2.5,2.75,3.0}`, doubled resolution (`t ∈ [0.5,10]`, 40 points,
+   1200 shots/point). Output: `results/linear trotter/linear_finegrid_a*.png/.npz` +
+   `summary_finegrid.png/.npz`.
+
+**Result 1 — linear beats quadratic outright, not just at one coefficient.** Coarse scan:
+best linear `a=2` gives RMS `0.157`; best quadratic `b=0.6` gives RMS `0.292` — linear
+wins by ~2x, and every tested linear coefficient in `{1,2,3,4}` beats every tested
+quadratic coefficient in `{0.3,0.4,0.6}` (the respective near-optimal neighbourhoods).
+Mechanism, visible in the comparison plot: quadratic tracks qutip about as well as linear
+out to `t≈7`, then its required step count (60 at `t=10`, hitting `R_CAP`) crushes
+post-selection survival and error spikes to `~0.6`; linear needs only 20 steps at `t=10`
+and stays flat around `0.2`. This is D-15's noise-vs-depth mechanism again, now showing
+up as a difference between *functional forms* rather than between fixed step counts.
+
+**Result 2 — fine grid gives a clean, non-lucky optimum.** `a`: `1.5→0.222, 1.75→0.174,
+2.0→0.162, 2.25→0.157 (min), 2.5→0.179, 2.75→0.189, 3.0→0.202`. A parabola fit through
+all 7 points gives a minimum at `a≈2.26` — matching the grid optimum to within `0.01`,
+and the measured curve is visibly a clean unimodal parabola (`summary_finegrid.png`), not
+jagged the way D-16's raw per-point argmin was. Adopted `TROTTER_SCHEDULE_C = 2.25` (the
+grid-verified value).
+
+**Cross-check against prior work.** `a≈2.25` sits close to D-17's own noisy-metric fit
+(`c=1.76±0.27`, range `1.20–2.08`) — the same regime, not a contradiction — and is about
+half of D-18/D-19's noiseless-fidelity `c=4.0`. D-17's needles were noted there as "all
+*under*-stepping" relative to the true trend; a slightly higher, needle-free estimate here
+(2.25 vs 1.76) is consistent with that, not surprising.
+
+**What this does not overturn.** D-18's core methodological point stands: a metric that
+can be accidentally fooled (D-16/D-17's raw two-observable argmin) is a bad way to *detect
+Trotter convergence*, and fidelity fixed that. What was wrong was conflating "detect
+Trotter convergence" with "choose the noise-aware schedule" — those need different
+metrics, and D-18/D-19 used the convergence-detection one for both jobs. D-21's direct
+scan sidesteps the two-stage decomposition entirely (no separate `r_T(t)` / `r_max`
+stages) by optimizing the real metric end-to-end — the noise constraint falls out of the
+objective automatically (error gets worse past the optimum) rather than needing to be
+bolted on as a separate cap, though `r_max=33` remains a useful, independently-derived
+sanity bound (re-confirmed unchanged above).
+
+**Caveat — `T_CAP=14.67` is algebra, not itself validated.** The D-21 scan only tested
+`t ∈ [0.5, 10]`. `T_CAP = r_max/c` is a correct statement about where the schedule
+`r*(t)=round(2.25t)` would first exceed the `r_max=33` noise budget if extrapolated, but
+whether `a=2.25` *remains* the error-minimizing coefficient all the way out to `t≈14.67`
+(rather than needing to grow, if quadratic-like effects start to matter at larger `t`) is
+unverified — re-run the scan with `t` extended past 10 before leaning on the extended cap
+for anything load-bearing.
+
+**Scope caveat, unchanged in kind from D-16 through D-19:** fitted to one config
+(`NumberOfBosonicModes=1, NumberOfFockStates=5, D_list=[1.0], spin_interaction_coefficient=0.5`,
+`G≈2.03`) against one `willow_pink` calibration snapshot. Re-run
+`src/adaptive_trotter_model_scan.py` (+ a finer follow-up grid if needed) if any of these
+change; `check_trotter_schedule_config` still only warns, doesn't block.
+
+**Overturned by:** a re-run at extended `t` showing `a=2.25` stops being optimal past
+`t≈10`, or a config/calibration change per the scope caveat above.
+
+---
+
+## D-22 — Second-order gets its own fitted linear schedule (`c=2.0`); still loses to
+first order even on a fair, order-specific schedule
+
+**Decided (2026-08-12).** Same day as D-21, same method, applied to the second-order
+(Strang) circuit. `NeuronSim2ndOrderTrotter.py` previously reused
+`recommended_trotter_steps(t)` — the schedule fitted to *first*-order error (D-18/D-19,
+then D-21) — deliberately, for an apples-to-apples matched-step comparison (D-20). That
+comparison's own writeup flagged this as leaving second order's faster convergence
+unexploited: Strang splitting's operator-norm error shrinks as `~r^-2` (vs first order's
+`~r^-1`), so a schedule derived for first order should, in principle, over-step second
+order. This entry derives second order's own schedule and re-runs the comparison to check
+whether that headroom is real.
+
+**Method — identical to D-21, on `build_second_order_trotter_circuit`.**
+`src/second_order_trotter_linear_scan.py`: coarse scan over `a ∈
+{0.25,0.5,0.75,1,1.5,2,3,4,6,8}` (`t∈[0.5,10]`, 20 points, 800 shots/point, noise ON +
+post-selection ON), then a fine scan around the coarse winner (`a ∈
+{1.25,...,2.75}` step 0.25, 40 points, 1200 shots/point) — same model config, same
+combined-error metric, same `t`-range as D-21, so directly comparable. Head-to-head
+comparison reuses D-21's saved fine-grid `a=2.25` result rather than re-running first
+order (same config, same resolution, no reason to re-sample).
+
+**Result 1 — the optimal coefficient is close to first order's, not smaller.** Coarse
+winner `a=2` (RMS `0.167`); fine grid gives a clean unimodal minimum, best grid point
+`a=2` (RMS `0.1657`), parabolic fit `a≈2.15`
+(`results/2nd order linear trotter/summary_finegrid.png`). This is close to — not
+markedly below — first order's `a=2.25`. The naive expectation from `~r^-2` vs `~r^-1`
+convergence was that second order should need noticeably fewer steps; that expectation
+is largely cancelled by its higher per-step gate cost: one (unmerged) Strang step compiles
+to 16 two-qubit gates vs first order's 10 (`~1.6x`, consistent with D-20's `~1.51x`
+amortized-large-`r` estimate). Re-deriving the trade-off (`ε_T ~ A t^3/r^2`, `ε_N ~ B' r`
+with `B'` scaled up `~1.6x`) still predicts a *linear* schedule (`r*=t·(2A/B')^(1/3)`),
+just with a smaller constant than a naive `r^-2`-convergence-only argument would suggest —
+consistent with what was measured.
+
+**Result 2 — first order still wins, but narrowly and not everywhere.**
+`results/first_vs_second_order_optimized_trotter_comparison.png`: at each order's own
+optimum, first order (`a=2.25`) gets RMS `0.1565`; second order (`a=2.0`, mean steps
+`10.5` vs first order's `11.8`) gets RMS `0.1657` — about `6%` higher, not a blowout.
+The per-`t` error trace shows this isn't uniform: second order tracks qutip *better* than
+first order for `t≲7` (first order has a pronounced local error bump around `t≈2` that
+second order doesn't share), then *worse* for `t≳7.5`, where second order's error spikes
+while first order's stays flatter. The RMS verdict is decided by that late-time region.
+
+**Conclusion.** D-20's original finding — second order loses once real noise and
+post-selection are in the picture, despite winning noiselessly — **survives** even after
+removing the schedule-mismatch confound D-20 itself flagged as a possible artefact. Both
+scripts are now on their own fair footing (own coefficient, own noise-budget cap), and
+first order still comes out ahead overall, though closely enough, and unevenly enough
+across `t`, that "second order is worse" is not the full story — it is a small
+net-negative average over a trade that runs the other way part of the time.
+
+**Own noise budget, not reused.** `TROTTER_SCHEDULE_R_MAX_2ND_ORDER=20` (vs first order's
+`33`), recomputed via `two_qubit_gates_per_trotter_step` against a single (`r=1`,
+unmerged-boundary) Strang step rather than reusing first order's `r_max` — a circuit
+property, so it has to be its own number given the ~1.6x gate-count difference.
+`TROTTER_SCHEDULE_T_CAP_2ND_ORDER = r_max/c = 10.0`. Unlike D-21's `t_cap=14.67` (which
+extrapolates past the tested `t≤10`), this cap lands almost exactly at the edge of what
+D-22 actually scanned — a coincidence, not designed, but it means this cap is not an
+extrapolation the way D-21's is.
+
+**Code changes:** `neuron_circuit.py` gains `TROTTER_SCHEDULE_C_2ND_ORDER`,
+`TROTTER_SCHEDULE_R_MAX_2ND_ORDER`, `TROTTER_SCHEDULE_T_CAP_2ND_ORDER`,
+`recommended_trotter_steps_2nd_order`, `trotter_schedule_cap_message_2nd_order` — parallel
+to, not replacing, the first-order versions. `NeuronSim2ndOrderTrotter.py` now calls
+these instead of the first-order schedule. Verified end-to-end: default run (`Time=20`)
+correctly warns and caps to `t=10.00`, produces a sane plot tracking qutip,
+`results/NeuronSim2ndOrderTrotter_noisy.png`.
+
+**Scope caveat, unchanged in kind from D-16 through D-21:** fitted to one config
+(`NumberOfBosonicModes=1, NumberOfFockStates=5, D_list=[1.0], spin_interaction_coefficient=0.5`,
+`G≈2.03`) against one `willow_pink` calibration snapshot. Re-run
+`src/second_order_trotter_linear_scan.py` if any of these change.
+
+**Overturned by:** a config change per the scope caveat, or evidence the late-`t` region
+driving second order's RMS deficit is itself a measurement artefact (e.g. shot-noise
+outliers) rather than real — worth a higher-shot re-check at `t∈[7,10]` specifically if
+this comparison becomes load-bearing for a paper claim.
+
+**Results and comparison (`notes/first-vs-second-order-trotter-comparison.md`):
+noise sign-flips the answer.** At matched step count (both scripts share D-18/D-19's
+schedule, fitted for first order): **noiseless**, second order wins clearly — RMS error
+vs. qutip drops `1.7x` (occupation) to `15.7x` (spin magnetisation), consistent with the
+`O(r^-4)` vs `O(r^-2)` convergence-order difference confirmed above. **Noisy,
+post-selected** (the hardware-realistic case), second order is *worse* (occupation RMS
+0.554 vs first order's 0.382) and its post-selection survival rate is lower (45.3% vs
+53.2% mean) — because it costs `~1.51x` the two-qubit gates per step (D-20 above), and
+D-19's schedule was already tuned close to the noise budget edge for *first*-order error,
+so the extra per-step gate cost pushes an already-tight operating point further into the
+noise-dominated regime (D-15's mechanism, now demonstrated across circuit variants, not
+just across step counts within one). **Not a verdict against second order** — it is a
+mismatched-schedule artefact: the fair comparison is fewer steps at higher per-step
+accuracy, not the same steps at higher per-step cost. Deriving a second-order-specific
+D-18-style schedule (predicted to allow a *later* cap than `t≈8.25`, not an earlier one,
+given the shallower `r*(t)` scaling `O(r^-4)` implies) is flagged as the natural next
+step and not pursued here.

@@ -18,7 +18,7 @@ from qutip import basis, tensor, sesolve, fock
 from neuron_circuit import (
     QutipHamiltonian,
     find_optimal_SpinBosonInteractionCoefficent,
-    find_low_error_qubit_chain,
+    find_low_error_qubit_embedding,
     map_and_compile_for_willow,
     build_trotter_circuit,
     build_second_order_trotter_circuit,
@@ -177,7 +177,7 @@ willow_noise_model = cirq_google.NoiseModelFromGoogleNoiseProperties(
 )
 willow_target_gateset = willow_device.metadata.compilation_target_gatesets[0]
 total_qubits = L * N + L
-willow_qubit_chain = find_low_error_qubit_chain(willow_device, willow_calibration, total_qubits)
+willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibration, N, L)
 
 full_circuit, all_qubits = build_trotter_circuit(D_list, J, N, L, 6.0 / 7, 7, G)
 compiled_circuit = map_and_compile_for_willow(full_circuit, all_qubits, willow_qubit_chain, willow_target_gateset)

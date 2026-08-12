@@ -2,17 +2,21 @@
 
 Only difference from NuronSim.py: circuits are built with
 build_second_order_trotter_circuit instead of build_trotter_circuit (see its docstring
-in neuron_circuit.py for the merged-boundary-layer construction). Everything else --
-Hamiltonian, G calibration, Willow mapping/compilation, noise model, post-selection,
-adaptive step schedule -- is identical, so results are directly comparable at matched
-(t, NumberOfTrotterSteps) between the two scripts. See notes/second-order-trotter.md and
+in neuron_circuit.py for the merged-boundary-layer construction), and the adaptive step
+schedule is second-order-specific (recommended_trotter_steps_2nd_order, D-22) rather than
+reused from first order. See notes/second-order-trotter.md and
 notes/first-vs-second-order-trotter-comparison.md.
 
-Deliberately reuses recommended_trotter_steps(t) -- the schedule fitted to *first*-order
-Trotter error (D-18) -- rather than deriving a second-order-specific schedule. That keeps
-the comparison apples-to-apples at matched gate budgets; a schedule exploiting second
-order's faster r^-4 convergence to use far fewer steps is a natural follow-up, not done
-here (see the comparison notes' "not pursued" section).
+Uses recommended_trotter_steps_2nd_order(t) -- its own schedule, fit directly against
+noisy, post-selected observable error on THIS circuit (D-22,
+src/second_order_trotter_linear_scan.py), superseding the earlier choice to reuse
+first-order's schedule for an apples-to-apples matched-step comparison (D-20). D-22 found
+the optimized coefficient (a=2.0) comes out close to first order's own (a=2.25) despite
+second order's faster r^-2 convergence -- its ~1.6x higher per-step gate cost roughly
+cancels the advantage -- and that even with its own fair schedule, second order still
+loses to first order on RMS error (0.166 vs 0.157), though closely and with second order
+actually ahead at early-to-mid t. See D-22 and
+results/first_vs_second_order_optimized_trotter_comparison.png.
 """
 import matplotlib.pyplot as plt
 import math
@@ -26,15 +30,15 @@ from neuron_circuit import (
     QutipHamiltonian,
     find_optimal_SpinBosonInteractionCoefficent,
     compute_observables_from_z_expectations,
-    find_low_error_qubit_chain,
+    find_low_error_qubit_embedding,
     map_and_compile_for_willow,
     build_second_order_trotter_circuit,
-    recommended_trotter_steps,
+    recommended_trotter_steps_2nd_order,
     check_trotter_schedule_config,
-    trotter_schedule_cap_message,
+    trotter_schedule_cap_message_2nd_order,
     sample_shots_with_postselection,
     annotate_trotter_step_segments,
-    TROTTER_SCHEDULE_T_CAP,
+    TROTTER_SCHEDULE_T_CAP_2ND_ORDER,
 )
 
 #------------------------
@@ -54,10 +58,9 @@ Time = 20
 NumberOfTrotterSteps = 7
 NumberOfTimeSteps = 100
 
-# Set True to use recommended_trotter_steps(t) instead of a single fixed
-# NumberOfTrotterSteps for every point in the sweep. Fitted for the FIRST-order circuit
-# (D-18) -- reused here unchanged for an apples-to-apples step-count comparison against
-# NuronSim.py, not because it's the right schedule for second order (see module docstring).
+# Set True to use recommended_trotter_steps_2nd_order(t) instead of a single fixed
+# NumberOfTrotterSteps for every point in the sweep. Fitted directly for THIS (second-
+# order) circuit against noisy, post-selected observable error (D-22).
 UseAdaptiveTrotterSteps = True
 
 # Shots per time point for the noisy Cirq sim's expectation-value estimate (qsimcirq
@@ -163,7 +166,7 @@ for mode_idx in range(NumberOfBosonicModes):
     qutip_ax1_list.append(ax1)
     qutip_ax2_list.append(ax2)
 
-NTrot_label = "adaptive (recommended_trotter_steps)" if UseAdaptiveTrotterSteps else str(NumberOfTrotterSteps)
+NTrot_label = "adaptive (recommended_trotter_steps_2nd_order)" if UseAdaptiveTrotterSteps else str(NumberOfTrotterSteps)
 plt.suptitle(f"[2nd-order Trotter] N = {NumberOfFockStates}, G = {SpinBosonInteractionCoefficent:.3g}, J={spin_interaction_coefficient} , NTrot= {NTrot_label}", fontweight='bold', fontsize=12, y=0.98)
 
 qutip_fig.tight_layout(rect=[0, 0, 1, 0.93])
@@ -185,7 +188,7 @@ willow_target_gateset = willow_device.metadata.compilation_target_gatesets[0]
 
 # Pick a connected, low-error qubit chain matching our L x (N+1) linear topology
 # once — it doesn't depend on dt, only on the circuit's fixed qubit count (D-1).
-willow_qubit_chain = find_low_error_qubit_chain(willow_device, willow_calibration, total_qubits)
+willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibration, NumberOfFockStates, NumberOfBosonicModes)
 print(f"Mapped {total_qubits} logical qubits onto Willow ({processor_id}):")
 print("  " + " - ".join(str(q) for q in willow_qubit_chain))
 
@@ -200,19 +203,16 @@ if not UseNoiseModel:
 
 if UseAdaptiveTrotterSteps:
     check_trotter_schedule_config(NumberOfBosonicModes, NumberOfFockStates, D_list, spin_interaction_coefficient)
-    print("UseAdaptiveTrotterSteps = True — NumberOfTrotterSteps per point from recommended_trotter_steps(t) "
-          "(fitted for FIRST-order Trotter error, reused here for an apples-to-apples step-count comparison).")
-    # D-17/D-18: cap the sweep at the schedule's noise-budget limit rather than reporting
-    # points that would need more Trotter depth than the noise budget affords (not
-    # Trotter-converged at any reachable step count there — see trotter_schedule_cap_message).
-    # Second order converges faster in r than the schedule assumes, so this cap is
-    # conservative for this script (real second-order headroom is larger) -- see the
-    # comparison notes.
-    cap_message = trotter_schedule_cap_message(Time)
+    print("UseAdaptiveTrotterSteps = True — NumberOfTrotterSteps per point from "
+          "recommended_trotter_steps_2nd_order(t) (D-22, fitted directly for this second-order circuit).")
+    # D-22: cap the sweep at THIS schedule's own noise-budget limit (own r_max, since
+    # second-order steps cost more two-qubit gates each) rather than reporting points
+    # that would need more Trotter depth than the noise budget affords.
+    cap_message = trotter_schedule_cap_message_2nd_order(Time)
     if cap_message is not None:
         print(cap_message)
-        print(f"Capping sweep at Time={TROTTER_SCHEDULE_T_CAP:.2f} (was {Time}).")
-        Time = TROTTER_SCHEDULE_T_CAP
+        print(f"Capping sweep at Time={TROTTER_SCHEDULE_T_CAP_2ND_ORDER:.2f} (was {Time}).")
+        Time = TROTTER_SCHEDULE_T_CAP_2ND_ORDER
 
 # Arrays to store measurements. *_post is the primary result (post-selected on the unary
 # constraint, D-4); *_raw is the uncorrected marginal estimate over all shots, kept for
@@ -231,7 +231,7 @@ time_data = np.linspace(0.1, Time, NumberOfTimeSteps)
 # EXECUTION LOOP: total time t varies; step count is either fixed or adaptive per point
 # =====================================================================
 for time_idx, t in enumerate(time_data):
-    steps_t = recommended_trotter_steps(t) if UseAdaptiveTrotterSteps else NumberOfTrotterSteps
+    steps_t = recommended_trotter_steps_2nd_order(t) if UseAdaptiveTrotterSteps else NumberOfTrotterSteps
     trotter_steps_used[time_idx] = steps_t
     dt = t / steps_t
 
@@ -297,9 +297,9 @@ for mode_idx in range(NumberOfBosonicModes):
     spin_scatter = ax2.scatter(time_data, spin_data, color=color_spin, marker='s', edgecolors='black', linewidths=0.5, alpha=0.8, zorder=5, label=f'{postselected_label} – Spin magnetisation')
     _cirq_overlay_artists.extend([boson_scatter, spin_scatter])
 
-    if UseAdaptiveTrotterSteps and TROTTER_SCHEDULE_T_CAP < time_data.max():
-        cap_line = ax1.axvline(TROTTER_SCHEDULE_T_CAP, color='gray', linestyle=':', linewidth=1, zorder=1,
-                                label=f'Trotter schedule cap (t={TROTTER_SCHEDULE_T_CAP:.2f})')
+    if UseAdaptiveTrotterSteps and TROTTER_SCHEDULE_T_CAP_2ND_ORDER < time_data.max():
+        cap_line = ax1.axvline(TROTTER_SCHEDULE_T_CAP_2ND_ORDER, color='gray', linestyle=':', linewidth=1, zorder=1,
+                                label=f'Trotter schedule cap (t={TROTTER_SCHEDULE_T_CAP_2ND_ORDER:.2f})')
         _cirq_overlay_artists.append(cap_line)
 
     # Mark which NumberOfTrotterSteps value applies to each cluster of points (varies

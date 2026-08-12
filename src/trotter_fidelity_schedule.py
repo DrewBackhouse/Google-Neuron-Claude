@@ -32,7 +32,7 @@ import cirq_google
 from neuron_circuit import (
     QutipHamiltonian,
     find_optimal_SpinBosonInteractionCoefficent,
-    find_low_error_qubit_chain,
+    find_low_error_qubit_embedding,
     map_and_compile_for_willow,
     build_trotter_circuit,
     trotter_final_statevector,
@@ -180,7 +180,7 @@ processor_id = "willow_pink"
 willow_device = cirq_google.engine.create_device_from_processor_id(processor_id)
 willow_calibration = cirq_google.engine.load_median_device_calibration(processor_id)
 willow_target_gateset = willow_device.metadata.compilation_target_gatesets[0]
-willow_qubit_chain = find_low_error_qubit_chain(willow_device, willow_calibration, total_qubits)
+willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibration, NumberOfFockStates, NumberOfBosonicModes)
 
 gates_per_step = two_qubit_gates_per_trotter_step(
     D_list, spin_interaction_coefficient, NumberOfFockStates, NumberOfBosonicModes,

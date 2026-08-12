@@ -254,28 +254,35 @@ def compute_observables_from_z_expectations(z_expectations, num_fock_states: int
     return boson_occ, spin_mag
 
 
-# Schedule derived by src/trotter_fidelity_schedule.py (2026-08-11) from noiseless state
-# fidelity F(t,r) = |<psi_qutip(t)|psi_trotter(t,r)>|^2 (D-18) -- replaces D-16/D-17's
-# two-observable-error schedule, which D-17 itself showed was contaminated by accidental
-# crossings ("needles": 6 of 14 argmins were isolated lucky matches in two real numbers,
-# not real convergence -- notes/optimal-trotter-steps.md). Monotone by construction
-# (r*(t) = round(c*t)), so it cannot reproduce that failure mode.
+# Schedule constant fitted by src/adaptive_trotter_model_scan.py + src/linear_trotter_
+# finegrid_scan.py (2026-08-12, D-21) directly against the noisy, post-selected observable
+# error vs qutip (D-16/D-17's combined-error metric, RMS'd over a t-sweep) -- superseding
+# D-18/D-19's c=4.0, which was fit against noiseless state fidelity F(t,r) instead.
 #
-# c is fitted from r_T(t) = smallest r with 1-F(t,r') < 0.05 sustained for all larger r',
-# using the tail half of the tested t-range (t >= 8) -- the low-t points are quantization-
-# noisy (steps_grid's coarse spacing near small r turns rounding into large swings in the
-# r_T/t ratio; see the script's printed whole-range-vs-tail comparison). r_max is a naive
-# (1 - eps_2q)^(gates_per_step * r) >= 0.5 budget against willow_pink's calibrated
-# two-qubit error on the compiled circuit (D-18 stage 2, independent of t, D-15's
-# mechanism); T_CAP = r_max / c is where the Trotter requirement first exceeds that
-# budget -- D-17's "cap the sweep" recommendation, now derived from fidelity instead of
-# asserted from an ad hoc "hard window".
+# Why the change: D-18 moved to fidelity because the old observable-error metric could be
+# fooled by accidental crossings ("needles", D-17). That fix is sound as a way to *detect
+# Trotter-only convergence* without contamination, but the resulting schedule was then read
+# off a metric that is blind to noise -- it will always recommend more steps than is
+# actually optimal once every extra step also costs post-selection survival. D-21 confirmed
+# this directly: scanning r=a*t and r=b*t^2 with noise ON and post-selection ON, linear beat
+# quadratic outright (best RMS 0.157 @ a=2 vs 0.292 @ b=0.6), and a finer scan around the
+# linear optimum found a clean unimodal minimum at a=2.25 (parabolic fit: a~=2.26) -- about
+# half of the noiseless-fidelity-derived c=4.0, and close to D-17's own noisy-metric fit
+# (c=1.76+-0.27, which D-18 had discarded along with the needle contamination it also had).
+#
+# r_max is unchanged by this -- it's a naive (1 - eps_2q)^(gates_per_step * r) >= 0.5 budget
+# against willow_pink's calibrated two-qubit error on the compiled circuit, a property of
+# the circuit/hardware, not of how c was fit (re-verified numerically post-refit: still 33).
+# T_CAP = r_max / c is where this schedule first exceeds that budget if extrapolated --
+# note the D-21 scan only tested t in [0.5, 10], so T_CAP=14.67 is an algebraic consequence
+# of r_max and c, not itself a validated claim that a=2.25 stays optimal all the way out to
+# t=14.67; re-check if that range starts mattering.
 #
 # Specific to the config below (G calibrates to ~2.03) against one willow_pink median
-# calibration snapshot -- re-run src/trotter_fidelity_schedule.py if any of these change,
+# calibration snapshot -- re-run src/adaptive_trotter_model_scan.py if any of these change,
 # this is not a general law. _SCHEDULE_CONFIG lets callers check they still match it.
 _SCHEDULE_CONFIG = dict(NumberOfBosonicModes=1, NumberOfFockStates=5, D_list=(1.0,), spin_interaction_coefficient=0.5)
-TROTTER_SCHEDULE_C = 4.0
+TROTTER_SCHEDULE_C = 2.25
 TROTTER_SCHEDULE_R_MAX = 33
 TROTTER_SCHEDULE_T_CAP = TROTTER_SCHEDULE_R_MAX / TROTTER_SCHEDULE_C
 
@@ -293,8 +300,9 @@ def check_trotter_schedule_config(NumberOfBosonicModes, NumberOfFockStates, D_li
 
 
 def recommended_trotter_steps(t: float) -> int:
-    """NumberOfTrotterSteps for time t: the monotone fidelity-derived schedule
-    r*(t) = round(TROTTER_SCHEDULE_C * t) (D-18, src/trotter_fidelity_schedule.py).
+    """NumberOfTrotterSteps for time t: the monotone schedule r*(t) = round(TROTTER_SCHEDULE_C * t),
+    fit directly against noisy, post-selected observable error (D-21,
+    src/adaptive_trotter_model_scan.py + src/linear_trotter_finegrid_scan.py).
     Monotone by construction, so unlike D-16's interpolated per-point argmin it cannot
     produce D-17's accidental low-step dips. Does not itself enforce the noise-budget cap
     (TROTTER_SCHEDULE_T_CAP) -- callers sweeping a t range should check that separately
@@ -314,22 +322,156 @@ def trotter_schedule_cap_message(requested_time: float) -> str | None:
                 f"schedule's noise-budget cap (t_cap={TROTTER_SCHEDULE_T_CAP:.2f}, "
                 f"r_max={TROTTER_SCHEDULE_R_MAX}) -- beyond this point the required step "
                 f"count is not affordable under the noise budget, so results are not "
-                f"Trotter-converged at any reachable step count (D-17/D-18).")
+                f"Trotter-converged at any reachable step count (D-17/D-18/D-21).")
     return None
 
 
-def find_low_error_qubit_chain(device: "cirq_google.GridDevice", calibration: "cirq_google.Calibration", chain_length: int) -> list:
-    """Depth-first search for a connected chain of `chain_length` GridQubits on
-    `device`, matching the circuit's own linear nearest-neighbour topology (every
-    mapped Pauli string is nearest-neighbour on the L x (N+1) grid, PROJECT.md).
-    Requiring the chain to follow device edges makes the embedding SWAP-free by
-    construction (D-1).
+# ---------------------------------------------------------------------------
+# Second-order (Strang) schedule (D-22) -- own constant, not a reuse of the first-order
+# one. src/second_order_trotter_linear_scan.py repeated D-21's coarse-then-fine method
+# directly on build_second_order_trotter_circuit: coarse grid over a broad a range, fine
+# grid around the winner. Result: a clean unimodal minimum at a=2.0 (parabolic fit:
+# a~=2.15) -- essentially the SAME coefficient as first order's a=2.25, despite second
+# order's ~r^-2 (vs ~r^-1) operator-norm convergence. The naive expectation was that
+# faster convergence should let second order use noticeably fewer steps; that expectation
+# turned out to be roughly cancelled by its higher per-step gate cost (16 two-qubit gates
+# for one unmerged Strang step here vs 10 for one first-order step -- a ~1.6x ratio,
+# consistent with D-20's ~1.51x amortized-large-r estimate).
+#
+# Head-to-head at each order's own optimum (results/first_vs_second_order_optimized_
+# trotter_comparison.png): first order still wins on RMS error (0.1565 vs 0.1657, ~6%
+# relative), so D-20's original finding (second order loses once noise is real) survives
+# even with a fair, order-specific schedule instead of the shared first-order one it was
+# testing against before -- not a schedule-mismatch artefact after all. The margin is
+# small and time-dependent, not uniform: per-point error (comparison plot) shows second
+# order tracking BETTER at early-to-mid t (t<7, where first order has a pronounced local
+# bump around t~2) and WORSE past t~7.5 -- the RMS verdict is close and driven by the
+# late-time region, not a blowout either way.
+#
+# r_max recomputed analogously (not reused from first order): two_qubit_gates_per_
+# trotter_step run against a single (r=1, unmerged) Strang step -- deliberately the
+# conservative, un-amortized per-step count rather than the slightly lower large-r
+# average, matching estimate_max_affordable_trotter_steps' own "deliberately coarse"
+# spirit. Gives r_max=20 (vs 33 for first order, tracking the ~1.6x gate-count ratio) and
+# T_CAP=r_max/c=10.0 -- which happens to sit right at the edge of D-22's tested range
+# (t<=10), so unlike first order's T_CAP this one is NOT an extrapolation past what was
+# actually scanned.
+TROTTER_SCHEDULE_C_2ND_ORDER = 2.0
+TROTTER_SCHEDULE_R_MAX_2ND_ORDER = 20
+TROTTER_SCHEDULE_T_CAP_2ND_ORDER = TROTTER_SCHEDULE_R_MAX_2ND_ORDER / TROTTER_SCHEDULE_C_2ND_ORDER
 
-    Greedily prefers the lowest-error two-qubit edges from the median calibration,
-    since the unused qubits on a 105-qubit chip are worth more as fidelity headroom
-    than as extra L/N (D-1 corollary) — this is a heuristic search for a good chain,
-    not a proof of the globally lowest-error one.
+
+def recommended_trotter_steps_2nd_order(t: float) -> int:
+    """NumberOfTrotterSteps for time t, for the SECOND-order (Strang) circuit: the
+    monotone schedule r*(t) = round(TROTTER_SCHEDULE_C_2ND_ORDER * t), fit directly
+    against noisy, post-selected observable error on build_second_order_trotter_circuit
+    (D-22, src/second_order_trotter_linear_scan.py). Own coefficient, own noise-budget
+    cap -- do not reuse recommended_trotter_steps (the first-order schedule) for the
+    second-order circuit; see the module-level comment above TROTTER_SCHEDULE_C_2ND_ORDER."""
+    return max(round(TROTTER_SCHEDULE_C_2ND_ORDER * t), 1)
+
+
+def trotter_schedule_cap_message_2nd_order(requested_time: float) -> str | None:
+    """Second-order analogue of trotter_schedule_cap_message -- checked once per sweep,
+    not once per point."""
+    if requested_time > TROTTER_SCHEDULE_T_CAP_2ND_ORDER:
+        return (f"WARNING: requested sweep time {requested_time:.2f} exceeds the SECOND-ORDER "
+                f"Trotter schedule's noise-budget cap (t_cap={TROTTER_SCHEDULE_T_CAP_2ND_ORDER:.2f}, "
+                f"r_max={TROTTER_SCHEDULE_R_MAX_2ND_ORDER}) -- beyond this point the required step "
+                f"count is not affordable under the noise budget, so results are not "
+                f"Trotter-converged at any reachable step count (D-22).")
+    return None
+
+
+def required_adjacency_edges(NumberOfFockStates: int, NumberOfBosonicModes: int) -> set:
+    """Logical-qubit pairs (cirq.LineQubit, matching build_trotter_circuit's ordering --
+    each site's N boson qubits, then one spin qubit per site) that need a two-qubit gate
+    somewhere in one Trotter step. Derived by actually building and decomposing
+    NetworkOfNeuronsTrotterStep with dummy (nonzero) coefficients and reading off its
+    two-qubit operations, rather than hand-derived from the Hamiltonian's structure --
+    only the circuit's qubit-usage STRUCTURE matters here, not the coefficient values, and
+    deriving it directly from the real circuit builder means this can never drift out of
+    sync if that construction changes.
+
+    At NumberOfBosonicModes==1 this is a simple chain (every consecutive LineQubit pair).
+    At NumberOfBosonicModes>1 it is a comb: L separate site-chains of N boson qubits each,
+    joined only through a spine of spin-spin links (H_spin) at one end -- see
+    find_low_error_qubit_embedding for why that does NOT embed as a straight 1D chain once
+    NumberOfBosonicModes>=3."""
+    dummy_D_list = [1.0] * NumberOfBosonicModes
+    step_circuit = NetworkOfNeuronsTrotterStep(
+        dummy_D_list, 1.0, NumberOfFockStates, NumberOfBosonicModes, 0.1, 1.0
+    )
+    decomposed = cirq.Circuit(cirq.decompose(step_circuit))
+    edges = set()
+    for op in decomposed.all_operations():
+        if len(op.qubits) == 2:
+            edges.add(tuple(sorted(op.qubits)))
+    return edges
+
+
+def find_low_error_qubit_embedding(device: "cirq_google.GridDevice", calibration: "cirq_google.Calibration",
+                                    NumberOfFockStates: int, NumberOfBosonicModes: int) -> list:
+    """Finds a low-error placement of the logical circuit (build_trotter_circuit's
+    LineQubit.range(total_qubits), in order) onto real device qubits such that every
+    required two-qubit gate lands on an actual device edge -- SWAP-free by construction
+    (D-1). Returns a list ordered to match LineQubit.range(total_qubits), so it drops
+    straight into map_and_compile_for_willow exactly like the old chain search did.
+
+    Generalizes the previous chain-only search (correct only for NumberOfBosonicModes<=1,
+    where the logical topology genuinely is a straight path) to the comb-shaped topology
+    every NumberOfBosonicModes>1 config actually needs: L site-chains of N boson qubits
+    each, joined only through a spine of spin-spin links (H_spin) at one end. That comb has
+    NO Hamiltonian path once NumberOfBosonicModes>=3: each site's far boson qubit (the end
+    away from its spin qubit) has degree 1 in the LOGICAL adjacency graph, i.e. is forced
+    to be a path endpoint -- and a path has only two endpoints, so >=3 such qubits already
+    makes a straight-chain embedding impossible regardless of the search algorithm. Forcing
+    the old chain search's qubit order onto a straight hardware chain for
+    NumberOfBosonicModes==2 (where a Hamiltonian path *does* exist, via a boson-spin-spin-
+    boson "snake") was the bug this replaces: `LineQubit.range` orders all of site 0's
+    qubits before all of site 1's, so the CNOT layer's site-1 boson-to-spin gate lands on
+    logical qubits that are far apart in that ordering and therefore not adjacent on a
+    hardware chain built to match consecutive LineQubit indices -- e.g. the
+    'ValueError: Qubit pair is not valid on device' seen running NumberOfBosonicModes=2.
+
+    Backtracking search: places logical qubits in an order that keeps each newly placed
+    qubit adjacent (in the required-edges graph) to at least one already-placed qubit, and
+    at each step restricts candidates to device qubits that are device-neighbours of every
+    already-placed logical neighbour -- greedily preferring the lowest calibrated two-qubit
+    XEB Pauli error, the same heuristic the old chain search used. Raises if no embedding is
+    found -- possible in principle even on a 2D device at large NumberOfBosonicModes /
+    NumberOfFockStates; not exercised here beyond the sizes in consistency_checks.py.
     """
+    edges = required_adjacency_edges(NumberOfFockStates, NumberOfBosonicModes)
+    total_qubits = NumberOfBosonicModes * NumberOfFockStates + NumberOfBosonicModes
+    logical_qubits = cirq.LineQubit.range(total_qubits)
+
+    neighbor_map = {q: set() for q in logical_qubits}
+    for a, b in edges:
+        neighbor_map[a].add(b)
+        neighbor_map[b].add(a)
+
+    # Placement order: BFS from the qubit with the most logical neighbours, so every
+    # qubit placed after the first already has a placed neighbour to anchor the device-
+    # adjacency search against (keeps candidate sets small instead of scanning the whole
+    # device for an unconstrained node).
+    start = max(logical_qubits, key=lambda q: len(neighbor_map[q]))
+    order = [start]
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        next_frontier = []
+        for q in frontier:
+            for n in sorted(neighbor_map[q], key=lambda x: x.x):
+                if n not in seen:
+                    seen.add(n)
+                    order.append(n)
+                    next_frontier.append(n)
+        frontier = next_frontier
+    for q in logical_qubits:  # only reachable if some logical qubit has no edges at all
+        if q not in seen:
+            order.append(q)
+
     graph = device.metadata.nx_graph
     two_qubit_error = calibration['two_qubit_parallel_cz_gate_xeb_pauli_error_per_cycle']
 
@@ -341,31 +483,42 @@ def find_low_error_qubit_chain(device: "cirq_google.GridDevice", calibration: "c
         neighbours = list(graph.neighbors(node))
         return np.mean([edge_error(node, n) for n in neighbours]) if neighbours else 1.0
 
-    for start in sorted(graph.nodes(), key=mean_neighbour_error):
-        chain = [start]
-        visited = {start}
+    device_qubits_by_quality = sorted(graph.nodes(), key=mean_neighbour_error)
 
-        def extend():
-            if len(chain) == chain_length:
+    placement = {}
+    used = set()
+
+    def candidates_for(logical_q):
+        placed_neighbours = [placement[n] for n in neighbor_map[logical_q] if n in placement]
+        if not placed_neighbours:
+            return device_qubits_by_quality
+        common = set(graph.neighbors(placed_neighbours[0]))
+        for pn in placed_neighbours[1:]:
+            common &= set(graph.neighbors(pn))
+        return sorted(common, key=lambda dq: np.mean([edge_error(dq, pn) for pn in placed_neighbours]))
+
+    def backtrack(i):
+        if i == len(order):
+            return True
+        logical_q = order[i]
+        for dq in candidates_for(logical_q):
+            if dq in used:
+                continue
+            placement[logical_q] = dq
+            used.add(dq)
+            if backtrack(i + 1):
                 return True
-            current = chain[-1]
-            candidates = sorted(
-                (n for n in graph.neighbors(current) if n not in visited),
-                key=lambda n: edge_error(current, n),
-            )
-            for n in candidates:
-                chain.append(n)
-                visited.add(n)
-                if extend():
-                    return True
-                chain.pop()
-                visited.discard(n)
-            return False
+            del placement[logical_q]
+            used.discard(dq)
+        return False
 
-        if extend():
-            return chain
-
-    raise RuntimeError(f"No connected {chain_length}-qubit chain found on this device.")
+    if not backtrack(0):
+        raise RuntimeError(
+            f"No SWAP-free embedding found for {total_qubits} logical qubits "
+            f"(NumberOfBosonicModes={NumberOfBosonicModes}, NumberOfFockStates={NumberOfFockStates}) "
+            f"on this device."
+        )
+    return [placement[q] for q in logical_qubits]
 
 
 def map_and_compile_for_willow(circuit: cirq.Circuit, source_qubits: list, qubit_chain: list, target_gateset) -> cirq.Circuit:
@@ -563,7 +716,7 @@ def trotter_final_statevector(D_list, spin_interaction_coefficient, NumberOfFock
 
 def two_qubit_error_rate_for_chain(willow_calibration, willow_qubit_chain):
     """Mean two-qubit XEB Pauli error over the edges of the chosen qubit chain -- same
-    calibration field find_low_error_qubit_chain optimizes against."""
+    calibration field find_low_error_qubit_embedding optimizes against."""
     two_qubit_error = willow_calibration['two_qubit_parallel_cz_gate_xeb_pauli_error_per_cycle']
     errs = []
     for a, b in zip(willow_qubit_chain[:-1], willow_qubit_chain[1:]):

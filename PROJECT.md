@@ -3,7 +3,7 @@
 **Read this file and `DECISIONS.md` at the start of every new chat.**
 Update both at the end of every chat.
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 ---
 
@@ -66,7 +66,7 @@ and D-11 for why it is a diagnostic rather than a per-shot filter.
 | # | Step | Status |
 |---|------|--------|
 | 1 | Classical exact simulation — fix `D_j`, `J`, `G`, `N`; confirm integrate-and-fire and propagation | in progress |
-| 2 | Trotter error analysis — Childs et al. commutator bounds on our 3-way split; test term orderings | D-17 derives the `r* ∝ t` scaling; D-18/D-19 implement the fidelity-based schedule (`src/trotter_fidelity_schedule.py`, `c=4.0`, capped `t≈8.25`); D-20 adds a second-order (Strang) alternative (`src/NeuronSim2ndOrderTrotter.py`) with an explicit convergence-order check |
+| 2 | Trotter error analysis — Childs et al. commutator bounds on our 3-way split; test term orderings | D-17 derives the `r* ∝ t` scaling; D-18/D-19 implement the fidelity-based schedule (`src/trotter_fidelity_schedule.py`); D-20 adds a second-order (Strang) alternative (`src/NeuronSim2ndOrderTrotter.py`) with an explicit convergence-order check; **D-21 re-fits the first-order schedule against the noisy, post-selected metric directly** (`src/adaptive_trotter_model_scan.py` + `src/linear_trotter_finegrid_scan.py`), confirming linear beats quadratic — `c=4.0` → `c=2.25`; **D-22 does the same for second order** (`src/second_order_trotter_linear_scan.py`, own `c=2.0`) — first order still wins head-to-head, narrowly |
 | 3 | Circuit synthesis and Willow layout — confirm SWAP-free embedding, pick qubit patch from calibration | prototyped at small scale (`src/NuronSim.py`, `L=1,N=5`); not yet run at the `L=3,N=6` target |
 | 4 | Noise simulation + post-selection — realistic error model, quantify unary-constraint recovery | noise model wired up (`src/NuronSim.py`, D-14); D-15→D-18/D-19 replaced the fixed/observable-metric step schedule with a fidelity-derived, capped, monotone one; **post-selection implemented (D-19)** — `neuron_circuit.sample_shots_with_postselection` filters shots on the unary one-hot constraint (D-4), mean survival rate `53.2%` in the first full sweep |
 | 5 | Configuration sweep — (L, N, steps) vs. observable fidelity; justify final choice | not started |
@@ -299,6 +299,51 @@ Full detail in D-19/D-20 and their linked notes files; summary here for the hand
 2nd-order script deliberately reuses the first-order-fitted schedule for a fair
 matched-step comparison, D-20) — deriving one would let it use substantially fewer steps
 for the same accuracy, a natural next step if the 2nd-order path becomes the default.
+
+**Trotter schedule re-fit against the real (noisy, post-selected) metric, and linear
+confirmed over quadratic (2026-08-12, D-21).** Prompted by a chat discussion of whether
+`r` should scale as `t` or `t²` (Childs et al. predicts `t²` for a *fixed Trotter
+tolerance*; D-17/D-18/D-19's schedule is `t`-linear because it solves a different problem
+— minimizing total error under a noise cost that grows with `r`). Rather than re-deriving
+this, ran a direct scan: `src/adaptive_trotter_model_scan.py` swept `r=a*t` and `r=b*t²`
+with noise ON + post-selection ON against qutip, then `src/linear_trotter_finegrid_scan.py`
+refined around the winner. **Linear won outright** (best RMS `0.157` @ `a=2` vs best
+quadratic RMS `0.292` @ `b=0.6` — quadratic's required depth crushes post-selection
+survival past `t≈7`). Fine grid found a clean unimodal optimum at **`a=2.25`** (parabolic
+fit: `a≈2.26`) — about half of D-18/D-19's noiseless-fidelity-derived `c=4.0`, and close
+to D-17's own (discarded) noisy-metric fit `c=1.76±0.27`. `neuron_circuit.py`'s
+`TROTTER_SCHEDULE_C` is now `2.25` (`R_MAX=33` unchanged, re-verified; `T_CAP` moves
+`8.25→14.67`, though that extension itself is unvalidated past the scan's tested `t≤10` —
+see D-21's caveat). Outputs: `results/linear trotter/`, `results/quadratic trotter/`,
+`results/linear_vs_quadratic_trotter_comparison.png`. **Confirmed end-to-end:** re-ran
+`NuronSim.py`'s default sweep (`Time=10`) with the new constant —
+`results/NuronSim_noisy_adaptive_postselect.png` tracks the qutip curve closely across
+the whole sweep, mean post-selection survival improved to `68.2%` (was `53.2%` under
+`c=4.0`), and the sweep no longer hits the cap warning at `Time=10` (new `t_cap≈14.67`).
+**Still not done:** extending the scan past `t=10` to check whether `a=2.25` still holds
+out to the new `t_cap≈14.67`, rather than needing to grow there.
+
+**Second-order (Strang) gets its own fitted schedule, and re-loses to first order fairly
+(2026-08-12, D-22).** Same day, same method as D-21, applied to
+`build_second_order_trotter_circuit` (`src/second_order_trotter_linear_scan.py`):
+coarse-then-fine scan, noise ON + post-selection ON. Result: optimal coefficient
+`a=2.0` (parabolic fit `a≈2.15`) — close to first order's `a=2.25`, not markedly smaller,
+because second order's faster `~r^-2` convergence is largely offset by its `~1.6x`
+higher per-step gate cost (16 vs 10 two-qubit gates/step). Head-to-head at each order's
+own optimum: first order RMS `0.1565` vs second order RMS `0.1657` — first order still
+wins, but by only `~6%`, and second order is actually *better* for `t≲7` (first order has
+a local error bump there) and worse only past `t≳7.5`, which is what decides the RMS
+verdict. So D-20's "second order loses under noise" finding **survives** even once the
+schedule-mismatch confound D-20 itself flagged is removed — this was a real result, not
+an artefact of reusing first order's schedule. `neuron_circuit.py` now has parallel
+second-order schedule constants/functions
+(`TROTTER_SCHEDULE_C_2ND_ORDER=2.0`, `recommended_trotter_steps_2nd_order`, etc.,
+`r_max=20`, `t_cap=10.0` — not extrapolated past the tested range, unlike D-21's cap);
+`NeuronSim2ndOrderTrotter.py` uses them and was verified end-to-end (correctly caps its
+default `Time=20` sweep to `10.00`,
+`results/NeuronSim2ndOrderTrotter_noisy.png` tracks qutip sanely). Outputs:
+`results/2nd order linear trotter/`,
+`results/first_vs_second_order_optimized_trotter_comparison.png`.
 
 ## Environment note
 
