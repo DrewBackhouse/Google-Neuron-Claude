@@ -1167,3 +1167,58 @@ accuracy, not the same steps at higher per-step cost. Deriving a second-order-sp
 D-18-style schedule (predicted to allow a *later* cap than `t≈8.25`, not an earlier one,
 given the shallower `r*(t)` scaling `O(r^-4)` implies) is flagged as the natural next
 step and not pursued here.
+
+---
+
+## D-24 — `src_clean/`: a decluttered, first-order-only copy of the working pipeline
+
+**Decided (2026-08-13).** Added `src_clean/` (`neuron_circuit.py`, `NuronSim.py`,
+`G_analytic.py`) as a second, minimal entry point alongside the existing `src/` — same
+run path, current best-known config, with the accumulated R&D scaffolding stripped out.
+Outputs go to `results/clean/`, not `results/`, so they never collide with or get
+mistaken for the historical R&D outputs.
+
+**Why.** `src/neuron_circuit.py` and `NuronSim.py` had accumulated the full derivation
+history for every constant in the pipeline (D-16 through D-23's schedule-fitting
+iterations, the second-order Trotter circuit, the fidelity/observable-error scan
+tooling, commented-out debug prints) — genuinely valuable as the record of how the
+current numbers were reached, but increasingly hard to read as "what does this actually
+run right now." Drew asked for a clean copy that just generates the plots, first order
+only, using the current best-known feature set.
+
+**What's in `src_clean/neuron_circuit.py`, and why each piece survived the cut:**
+physics/G calibration, the first-order circuit builders, D-23's coherence-aware
+embedding search, D-21's adaptive schedule constants (`c=2.25`), D-4/D-19's
+post-selection (now including the `*_removed`-shots estimator added this session), and
+the qubit-embedding-overlay/step-schedule-annotation plotting helpers — every function
+`NuronSim.py`'s run path actually calls, confirmed by checking its import list before
+cutting anything, not assumed. Dropped: `build_second_order_trotter_circuit` and its own
+schedule (D-20/D-22); the noiseless-fidelity/unary-subspace-projection tooling that
+existed only to *derive* the schedule (D-18); and the noise-budget-recomputation
+helpers (`two_qubit_gates_per_trotter_step` etc.), needed only by the one-off scans, not
+by a run using the already-fixed `TROTTER_SCHEDULE_R_MAX`. None of these were imported
+by `NuronSim.py`'s run path to begin with.
+
+**`src_clean/NuronSim.py`:** same run path; comments trimmed to state current behavior
+rather than the full D-16→D-23 investigation narrative; commented-out debug-print blocks
+removed; `NumberOfNoiseSamples` reset to the tested default (2000) rather than a
+session's temporary speed-testing value (500). Every current toggle carried over
+unchanged, including two added this session (`ShowPostSelectionRemovedPoints`,
+`ShowQubitEmbeddingOverlay`) and the Trotter-schedule cap being disabled-but-still-warned
+(Drew's request earlier this session) rather than truncating the sweep.
+
+**Verified, not just asserted.** Ran `src_clean/NuronSim.py` end-to-end (`GoogleQVM` env)
+and confirmed it reproduces the same qubit chain, the same post-selection survival rate
+(within shot noise), and visually identical plots to a same-config run of `src/NuronSim.py`.
+
+**Not a replacement.** `src/` remains the full historical record — every derivation
+script (`adaptive_trotter_model_scan.py`, `second_order_trotter_linear_scan.py`,
+`consistency_checks.py`, etc.) and both circuit orders stay there, and any
+re-derivation of a constant (schedule coefficients, embedding scoring, G calibration)
+should still happen there, then be hand-carried into `src_clean/` if it changes anything
+load-bearing. `src_clean/` has no derivation tooling of its own by design — it is the
+"run it" copy, not the "figure out what to run" copy.
+
+**Overturned by:** `src_clean/` silently drifting from `src/`'s constants (e.g. a future
+re-fit of `TROTTER_SCHEDULE_C` in `src/` that doesn't get carried over) — worth a
+periodic diff-check if both folders see continued use.

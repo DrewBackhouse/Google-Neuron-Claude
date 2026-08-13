@@ -3,7 +3,7 @@
 **Read this file and `DECISIONS.md` at the start of every new chat.**
 Update both at the end of every chat.
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 ---
 
@@ -394,6 +394,34 @@ sweep) still reflects the pre-fix embedding search and should be treated as stal
 examined closely — not redone since it wasn't this investigation's focus and its `L=3`
 case alone costs ~3 hours to re-run.
 
+**`NuronSim.py` feature additions, and a clean second entry point (2026-08-13).** Three
+small features added to `src/NuronSim.py`/`src/neuron_circuit.py`, then the whole
+pipeline copied into a decluttered `src_clean/` (D-24):
+
+1. The D-17/D-18 sweep cap (auto-truncating `Time` to `TROTTER_SCHEDULE_T_CAP`) is
+   disabled at Drew's request — the sweep now always runs to the full requested `Time`;
+   the noise-budget warning still prints, it just no longer truncates.
+2. `ShowQubitEmbeddingOverlay` toggle: `neuron_circuit.plot_qubit_embedding_overlay`
+   draws the `willow_pink` calibration grid (T1 per qubit, two-qubit CZ error per bond)
+   with the run's actual chosen qubits/edges highlighted in red, saved alongside the
+   results plot — a visual sanity check on `find_low_error_qubit_embedding`'s choice.
+   `src/willow_calibration_grid.py` (the plain, unhighlighted version) added alongside.
+3. `ShowPostSelectionRemovedPoints` toggle: `sample_shots_with_postselection` now also
+   returns `occ_removed`/`mag_removed` — the same per-point estimator as `*_post`, but
+   over exactly the shots post-selection discarded — plotted as greyed-out points beneath
+   the kept ones, so you can see what's actually being thrown away, not just the
+   survival-rate number.
+
+**`src_clean/`** (`neuron_circuit.py`, `NuronSim.py`, `G_analytic.py`) is a second,
+minimal entry point: same run path and current best-known config (D-21's schedule,
+D-23's embedding, D-4/D-19's post-selection, all three features above), with the
+second-order circuit, the schedule-derivation tooling, and the R&D comment history
+stripped out — see D-24 for the full accounting of what was kept/dropped and why.
+Verified to reproduce `src/NuronSim.py`'s output end-to-end. Outputs go to
+`results/clean/`, kept separate from `src/`'s outputs in `results/`. `src/` remains the
+full historical record and the place to re-derive any constant; changes there don't
+auto-propagate to `src_clean/`.
+
 ## Environment note
 
 Shell access to this folder **works**: read, write, execute, delete.
@@ -446,8 +474,10 @@ PROJECT.md     this file — outline, status, open questions
 DECISIONS.md   running log of what we chose and why
 requirements.txt / setup_env.sh   sandbox environment (see above)
 notes/         per-topic analysis
-src/           code
+src/           code — full R&D history, both Trotter orders, all derivation scripts
+src_clean/     clean first-order-only pipeline (current best-known config only, D-24)
 results/       generated output — disposable, regenerable from src/ (gitignored)
+results/clean/ output from src_clean/ — kept separate from src/'s outputs
 ```
 
 ## Which tool for which job
