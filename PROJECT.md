@@ -67,9 +67,9 @@ and D-11 for why it is a diagnostic rather than a per-shot filter.
 |---|------|--------|
 | 1 | Classical exact simulation — fix `D_j`, `J`, `G`, `N`; confirm integrate-and-fire and propagation | in progress |
 | 2 | Trotter error analysis — Childs et al. commutator bounds on our 3-way split; test term orderings | D-17 derives the `r* ∝ t` scaling; D-18/D-19 implement the fidelity-based schedule (`src/trotter_fidelity_schedule.py`); D-20 adds a second-order (Strang) alternative (`src/NeuronSim2ndOrderTrotter.py`) with an explicit convergence-order check; **D-21 re-fits the first-order schedule against the noisy, post-selected metric directly** (`src/adaptive_trotter_model_scan.py` + `src/linear_trotter_finegrid_scan.py`), confirming linear beats quadratic — `c=4.0` → `c=2.25`; **D-22 does the same for second order** (`src/second_order_trotter_linear_scan.py`, own `c=2.0`) — first order still wins head-to-head, narrowly |
-| 3 | Circuit synthesis and Willow layout — confirm SWAP-free embedding, pick qubit patch from calibration | prototyped at small scale (`src/NuronSim.py`, `L=1,N=5`); not yet run at the `L=3,N=6` target |
+| 3 | Circuit synthesis and Willow layout — confirm SWAP-free embedding, pick qubit patch from calibration | **D-1's zero-SWAP claim confirmed for `L=1–4`** — `neuron_circuit.find_low_error_qubit_embedding` (D-23) generalizes the old `L=1`-only chain search to a real subgraph embedding, needed because the `L≥2` logical topology is a comb, not a line (no Hamiltonian path exists at all once `L≥3`, proved not just patched). Coherence-aware (T1 + two-qubit error) qubit selection also required, not just gate-count — D-23. `L=3,N=5` exercised in `results/VMBenchmark/`; `L=3,N=6` target still not run |
 | 4 | Noise simulation + post-selection — realistic error model, quantify unary-constraint recovery | noise model wired up (`src/NuronSim.py`, D-14); D-15→D-18/D-19 replaced the fixed/observable-metric step schedule with a fidelity-derived, capped, monotone one; **post-selection implemented (D-19)** — `neuron_circuit.sample_shots_with_postselection` filters shots on the unary one-hot constraint (D-4), mean survival rate `53.2%` in the first full sweep |
-| 5 | Configuration sweep — (L, N, steps) vs. observable fidelity; justify final choice | not started |
+| 5 | Configuration sweep — (L, N, steps) vs. observable fidelity; justify final choice | not formally started, but `results/VMBenchmark/` (D-23) is a first pass at exactly this: `L=1→3` and `N=3→7` sweeps with noise+post-selection, including a per-`N` schedule re-fit. Early signal: `a` (the schedule constant) is flat at `2` for `N=3–6`, then drops to `1.5` at `N=7` alongside a notably higher error floor — a lead on real Trotter-error-vs-`N` scaling, not yet confirmed as a trend (one data point) |
 
 Each step gets its own chat. This file is the handover.
 
@@ -344,6 +344,55 @@ default `Time=20` sweep to `10.00`,
 `results/NeuronSim2ndOrderTrotter_noisy.png` tracks qutip sanely). Outputs:
 `results/2nd order linear trotter/`,
 `results/first_vs_second_order_optimized_trotter_comparison.png`.
+
+**`NuronSim.py` fixed for `NumberOfBosonicModes>1` (2026-08-12).** Running it at `L=2`
+crashed (`ValueError: Qubit pair is not valid on device`). Root cause: the qubit-chain
+search only ever looked for a straight 1D device chain and mapped the circuit onto it in
+`LineQubit` index order — correct only at `L=1`, where the logical topology genuinely is
+a line. At `L≥2` the real topology is a comb (each site's boson chain, joined only via a
+spine of spin-spin links at one end), which has no Hamiltonian path at all once `L≥3`
+(provably — every site's far boson qubit is forced to be a path endpoint, and a path has
+only two). Fixed by `neuron_circuit.find_low_error_qubit_embedding`, a real subgraph
+embedding search onto Willow's actual 2D connectivity, replacing the old chain-only
+search everywhere it was used (`NuronSim.py`, `NeuronSim2ndOrderTrotter.py`, and every
+analysis script). Verified valid at `L=1–4`.
+
+**VM benchmark figure suite produced, and it surfaced a real qubit-selection quality bug
+in the fix above (2026-08-12, D-23).** `results/VMBenchmark/`: an `L=1,N=5`
+step-count/noise/post-selection ablation (4 figures), an `L=1→3` sweep at `N=5,J=0.1` (3
+figures), and an `N=3→7` sweep at `L=1` with a fresh per-`N` linear-schedule re-fit (5
+figures + 5 schedule-fit diagnostics) — `src/vm_benchmark.py`, now with
+`--part1`/`--part2`/`--part3`/`--n=` flags for targeted re-runs.
+
+Drew noticed one figure was visibly worse than a nominally-identical existing result,
+which led to finding that the embedding search above was structurally correct but
+*low-quality*: it returned the first valid chain found rather than a good one, and even
+once fixed to compare alternatives, scoring by two-qubit gate error alone missed a
+qubit with `T1=39us` against a chip-wide `~70us` median (post-selection can't catch
+T1-driven decoherence — it only checks the boson registers' one-hot constraint). Took
+three rounds to fix properly: (1) compare multiple candidate chains instead of returning
+the first valid one, (2) score by percentile rank of *both* two-qubit error and `1/T1`
+(unit-free combination), (3) a hard floor excluding the chip-wide worst T1 decile
+outright, since percentile scoring alone still let the same bad qubit through into two
+configs where its neighbourhood's gate errors were good enough to outweigh it in the sum.
+Full diagnostic trail in D-23.
+
+This also explained an apparent physics anomaly Drew caught in the `N`-sweep: an
+`N=5` outlier and a suspiciously flat `a`-vs-`N` trend both turned out to be artifacts of
+each `N` getting an independently-unoptimized (and inconsistently noisy) chain, not real
+signal — confirmed directly by replaying both candidate schedules on the actual chain
+used and showing the "wrong" one really did win *on that specific chain*. After the fix
+and two re-runs, `a` is flat at `2` across `N=3–6` (now trustworthy) and drops to `1.5`
+at `N=7` — checked and NOT a repeat of the same bug (no T1 outlier), instead consistent
+with `N=7` needing 7 required two-qubit edges per Trotter step vs `4–6` for smaller `N`,
+i.e. possibly the first real sign of Trotter-error growth with `N` showing up. One data
+point, not yet a confirmed trend — extending past `N=7` or adding resolution around
+`N=6–7` would be the natural next step if this becomes load-bearing.
+
+**Left deliberately unregenerated:** Part 2 (`results/VMBenchmark/05`–`07`, the `L=1→3`
+sweep) still reflects the pre-fix embedding search and should be treated as stale if
+examined closely — not redone since it wasn't this investigation's focus and its `L=3`
+case alone costs ~3 hours to re-run.
 
 ## Environment note
 

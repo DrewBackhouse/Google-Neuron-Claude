@@ -438,9 +438,45 @@ def find_low_error_qubit_embedding(device: "cirq_google.GridDevice", calibration
     qubit adjacent (in the required-edges graph) to at least one already-placed qubit, and
     at each step restricts candidates to device qubits that are device-neighbours of every
     already-placed logical neighbour -- greedily preferring the lowest calibrated two-qubit
-    XEB Pauli error, the same heuristic the old chain search used. Raises if no embedding is
-    found -- possible in principle even on a 2D device at large NumberOfBosonicModes /
-    NumberOfFockStates; not exercised here beyond the sizes in consistency_checks.py.
+    XEB Pauli error, the same heuristic the old chain search used. A single such search
+    only finds *a* valid embedding, not the lowest-error one -- it commits to the first
+    complete assignment found and never revisits an earlier, locally-fine-looking choice
+    just because a later edge (e.g. the one carrying H_CNOT) turned out worse than it could
+    have been. So the search is repeated once per candidate starting device qubit (there
+    are only ~100, and each attempt is fast), and the embedding with the lowest total score
+    among all successful attempts is kept -- this matters in practice: an earlier version
+    that returned the first success placed a config's H_CNOT edge on a ~1.7x higher-error
+    link than this version does, degrading spin magnetization specifically (post-selection
+    has no way to catch or correct that -- it only checks the boson registers' one-hot
+    constraint, D-4) while leaving boson occupation and survival rate looking fine, i.e. a
+    regression that would NOT show up in the usual health checks.
+
+    The score itself combines TWO calibration signals, each converted to a percentile rank
+    among all device edges/qubits (0=best, 1=worst) so they're on comparable, unit-free
+    scales before summing: two-qubit CZ XEB Pauli error per required edge, and T1-driven
+    idle decoherence (1/T1) per qubit used. Two-qubit error alone is not enough -- checked
+    directly (2026-08-12): a version scoring only on summed two-qubit edge error found an
+    embedding with LOWER total two-qubit error than a known-good reference chain, yet
+    reproducibly (3 independent noisy runs) gave ~50% worse RMS error against qutip, because
+    it happened to route through one qubit with T1=39us against a chip-wide typical ~70us --
+    a coherence problem the two-qubit-only score couldn't see. Percentile ranks (rather than
+    a hand-tuned relative weight between a dimensionless error probability and an
+    inverse-microseconds quantity) sidestep needing to calibrate that weight from gate
+    durations this function doesn't have access to.
+
+    Even that percentile score is a SOFT trade-off, though, and turned out not to be
+    enough on its own either -- checked directly (2026-08-12): the same T1=39us qubit
+    still got selected for two different (larger) configs even with the percentile score
+    active, because its neighbourhood's two-qubit edges were good enough that the summed
+    score still favoured including it over an alternative that avoided it -- inflating
+    noisy-run RMS error against qutip by ~2x for those configs. So candidacy now has a
+    hard floor too: any device qubit below the 10th percentile of chip-wide T1 is excluded
+    from the search outright, before scoring -- it doesn't matter how good its edges are.
+
+    Raises if no embedding is found at all -- possible in principle even on a 2D device at
+    large NumberOfBosonicModes/NumberOfFockStates, and now slightly more likely given the
+    T1 floor shrinks the usable qubit pool by construction; not exercised here beyond the
+    sizes in consistency_checks.py.
     """
     edges = required_adjacency_edges(NumberOfFockStates, NumberOfBosonicModes)
     total_qubits = NumberOfBosonicModes * NumberOfFockStates + NumberOfBosonicModes
@@ -455,10 +491,10 @@ def find_low_error_qubit_embedding(device: "cirq_google.GridDevice", calibration
     # qubit placed after the first already has a placed neighbour to anchor the device-
     # adjacency search against (keeps candidate sets small instead of scanning the whole
     # device for an unconstrained node).
-    start = max(logical_qubits, key=lambda q: len(neighbor_map[q]))
-    order = [start]
-    seen = {start}
-    frontier = [start]
+    start_logical = max(logical_qubits, key=lambda q: len(neighbor_map[q]))
+    order = [start_logical]
+    seen = {start_logical}
+    frontier = [start_logical]
     while frontier:
         next_frontier = []
         for q in frontier:
@@ -474,51 +510,96 @@ def find_low_error_qubit_embedding(device: "cirq_google.GridDevice", calibration
 
     graph = device.metadata.nx_graph
     two_qubit_error = calibration['two_qubit_parallel_cz_gate_xeb_pauli_error_per_cycle']
+    t1_micros = calibration['single_qubit_idle_t1_micros']
 
     def edge_error(a, b):
         val = two_qubit_error.get((a, b)) or two_qubit_error.get((b, a))
         return val[0] if val is not None else 1.0  # uncalibrated edge: treat as worst-case
 
+    def inv_t1(q):
+        val = t1_micros.get((q,))
+        return 1.0 / val[0] if val is not None else 1.0  # uncalibrated qubit: treat as worst-case
+
     def mean_neighbour_error(node):
         neighbours = list(graph.neighbors(node))
         return np.mean([edge_error(node, n) for n in neighbours]) if neighbours else 1.0
 
-    device_qubits_by_quality = sorted(graph.nodes(), key=mean_neighbour_error)
+    # Hard T1 floor: exclude the chip-wide worst decile from candidacy entirely, rather
+    # than only soft-penalizing it via the percentile score below. The percentile score
+    # alone let one T1=39us qubit (chip median ~70us) into two chains anyway -- checked
+    # directly (2026-08-12): its neighbourhood's two-qubit edges were good enough that the
+    # SUM of percentile ranks still favoured including it over a chain that avoided it,
+    # inflating noisy-run RMS error against qutip by ~2x for those configs despite the
+    # percentile score being "aware" of it. A hard floor on the input candidate pool fixes
+    # this the way the soft penalty couldn't: this qubit (and its rank-mates) simply
+    # cannot be chosen, regardless of how good its edges are.
+    T1_FLOOR_PERCENTILE = 10
+    t1_floor = np.percentile([t1_micros[(q,)][0] for q in graph.nodes() if (q,) in t1_micros], T1_FLOOR_PERCENTILE)
+    usable_qubits = {q for q in graph.nodes() if t1_micros.get((q,), [0.0])[0] >= t1_floor}
 
-    placement = {}
-    used = set()
+    device_qubits_by_quality = sorted(usable_qubits, key=mean_neighbour_error)
 
-    def candidates_for(logical_q):
-        placed_neighbours = [placement[n] for n in neighbor_map[logical_q] if n in placement]
-        if not placed_neighbours:
-            return device_qubits_by_quality
-        common = set(graph.neighbors(placed_neighbours[0]))
-        for pn in placed_neighbours[1:]:
-            common &= set(graph.neighbors(pn))
-        return sorted(common, key=lambda dq: np.mean([edge_error(dq, pn) for pn in placed_neighbours]))
+    # Percentile-rank tables for the final cross-attempt scoring (see docstring) -- built
+    # once, over every device edge/qubit, so any candidate's value can be looked up by
+    # position in a sorted array rather than repeatedly recomputing a rank from scratch.
+    all_edge_errors = np.sort([edge_error(a, b) for a, b in graph.edges()])
+    all_inv_t1 = np.sort([inv_t1(q) for q in graph.nodes()])
 
-    def backtrack(i):
-        if i == len(order):
-            return True
-        logical_q = order[i]
-        for dq in candidates_for(logical_q):
-            if dq in used:
-                continue
-            placement[logical_q] = dq
-            used.add(dq)
-            if backtrack(i + 1):
+    def edge_error_percentile(a, b):
+        return np.searchsorted(all_edge_errors, edge_error(a, b)) / max(len(all_edge_errors) - 1, 1)
+
+    def t1_penalty_percentile(q):
+        return np.searchsorted(all_inv_t1, inv_t1(q)) / max(len(all_inv_t1) - 1, 1)
+
+    def attempt(forced_first_choice):
+        placement = {}
+        used = set()
+
+        def candidates_for(logical_q, i):
+            if i == 0:
+                return [forced_first_choice]
+            placed_neighbours = [placement[n] for n in neighbor_map[logical_q] if n in placement]
+            if not placed_neighbours:
+                return device_qubits_by_quality
+            common = set(graph.neighbors(placed_neighbours[0])) & usable_qubits
+            for pn in placed_neighbours[1:]:
+                common &= set(graph.neighbors(pn))
+            return sorted(common, key=lambda dq: np.mean([edge_error(dq, pn) for pn in placed_neighbours]))
+
+        def backtrack(i):
+            if i == len(order):
                 return True
-            del placement[logical_q]
-            used.discard(dq)
-        return False
+            logical_q = order[i]
+            for dq in candidates_for(logical_q, i):
+                if dq in used:
+                    continue
+                placement[logical_q] = dq
+                used.add(dq)
+                if backtrack(i + 1):
+                    return True
+                del placement[logical_q]
+                used.discard(dq)
+            return False
 
-    if not backtrack(0):
+        return dict(placement) if backtrack(0) else None
+
+    best_placement, best_score = None, None
+    for start_dq in device_qubits_by_quality:
+        result = attempt(start_dq)
+        if result is None:
+            continue
+        score = (sum(edge_error_percentile(result[a], result[b]) for a, b in edges)
+                 + sum(t1_penalty_percentile(dq) for dq in result.values()))
+        if best_score is None or score < best_score:
+            best_placement, best_score = result, score
+
+    if best_placement is None:
         raise RuntimeError(
             f"No SWAP-free embedding found for {total_qubits} logical qubits "
             f"(NumberOfBosonicModes={NumberOfBosonicModes}, NumberOfFockStates={NumberOfFockStates}) "
             f"on this device."
         )
-    return [placement[q] for q in logical_qubits]
+    return [best_placement[q] for q in logical_qubits]
 
 
 def map_and_compile_for_willow(circuit: cirq.Circuit, source_qubits: list, qubit_chain: list, target_gateset) -> cirq.Circuit:

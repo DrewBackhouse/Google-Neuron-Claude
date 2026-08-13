@@ -1033,6 +1033,123 @@ driving second order's RMS deficit is itself a measurement artefact (e.g. shot-n
 outliers) rather than real — worth a higher-shot re-check at `t∈[7,10]` specifically if
 this comparison becomes load-bearing for a paper claim.
 
+---
+
+## D-23 — Willow qubit embedding needs both coherence-aware scoring AND a hard T1 floor;
+Trotter schedule constant is flat across N=3–6 then breaks at N=7
+
+**Decided (2026-08-12).** Two linked results from producing `results/VMBenchmark/` (a
+requested figure suite: an `L=1,N=5` step/noise/post-selection ablation; an `L=1→3`
+sweep at `N=5,J=0.1`; and an `N=3→7` sweep at `L=1` with a fresh per-`N` schedule
+re-fit). Both trace back to the same root cause, found while investigating why one
+VMBenchmark figure looked visibly worse than a nominally-identical D-21 result.
+
+**Part A — `find_low_error_qubit_embedding` (D-22's replacement for the old chain-only
+search) needed two more rounds of fixing beyond bare correctness.**
+
+1. *Symptom.* `results/VMBenchmark/04_adaptive_noisy_postselect.png` (`L=1,N=5,a=2.25`,
+   noise+post-selection ON) should be near-identical to
+   `results/linear trotter/linear_finegrid_a2.25.png` (D-21's own fine-grid point at the
+   same `a`) — same model, same schedule. Measured RMS vs qutip: `0.292` vs D-21's
+   `0.157`, roughly double.
+2. *Cause 1 — the search found *a* valid embedding, not a good one.* D-22's version
+   built one BFS placement order, ran one backtracking search, and returned the first
+   complete assignment — it never compared alternatives. Fix: repeat the search once per
+   candidate starting device qubit (~100, each fast) and keep the lowest-total-two-qubit-
+   error result. This alone dropped RMS to `~0.235` — better, but still short of `0.157`,
+   and reproducible across 3 independent noisy runs (`0.235, 0.237, 0.238`), ruling out
+   shot noise as the remaining gap.
+3. *Cause 2 — total two-qubit CZ error is an incomplete proxy.* Direct comparison:
+   the new "best" chain had a LOWER summed CZ edge error (`0.0088`) than D-21's original
+   chain (`0.0103`), yet performed worse. Traced to one qubit with `T1=39us` against a
+   chip-wide median of `~70us` — a coherence problem invisible to a metric that only
+   looks at gate error. Fix: score each candidate embedding by the SUM of percentile
+   ranks (0=best, 1=worst, chip-wide) of both two-qubit CZ error per required edge and
+   `1/T1` per qubit used — unit-free, so no need to hand-calibrate a relative weight
+   between a dimensionless probability and an inverse-microsecond quantity. This raised
+   RMS to `~0.173`, close to D-21's `0.157`.
+4. *Cause 3 — a percentile SUM is still a soft trade-off.* The SAME `T1=39us` qubit
+   still got selected for two different, larger configs (`N=6` and `N=7` in the Part 3
+   sweep below) even under percentile scoring, because its local neighbourhood's CZ
+   edges were good enough that the summed score still favoured including it. Fix: add a
+   hard floor — device qubits below the 10th percentile of chip-wide T1 are excluded from
+   candidacy entirely, before any scoring. Re-running `N=6` with this fix dropped its RMS
+   from `0.378` back to `0.191`, in line with `N=3–5`.
+5. *Verified* correct (valid device-respecting embeddings) at `N,L` up to `(6,4)`
+   (28 qubits) after every stage, and confirmed the final version excludes the known-bad
+   qubit at every tested config.
+
+**Part B — Part 3's `a`-vs-`N` schedule refit (per-N `r=a*t` coarse+refine scan, same
+method as D-21) was contaminated by exactly this bug on its first run, and needed a full
+re-run to trust.**
+
+The first Part 3 run (pre-fix search) gave `a = 2.5, 2.5, 1.5, 2.5, 2.5` for
+`N = 3,4,5,6,7` — `N=5`'s `a=1.5` was flagged (Drew) as an outlier inconsistent with
+D-21's own dedicated `N=5` scan (`a≈2.25`), and the near-constancy of `a` across `N` was
+flagged as suspicious against the expectation that Trotter error should grow with `N`.
+Both diagnoses were correct, and both trace to Part A: Part 3 picked an independent,
+unoptimized chain per `N` (via the pre-fix search), so each `N`'s fitted `a` was really
+responding to that specific chain's noise level, not to `N`'s intrinsic physics.
+**Directly confirmed, not just inferred:** replaying `a=1.5` vs `a=2.25` on Part 3's
+actual `N=5` chain at D-21's own resolution gave `a=1.5` RMS `0.259` vs `a=2.25` RMS
+`0.311` — `a=1.5` genuinely wins *on that chain*. Mechanism: from the `r*=t·√(A/B)`
+trade-off (D-21), a worse chain means a larger per-step noise coefficient `B`, which
+pushes the optimum toward fewer steps — worse hardware favours shallower schedules, not
+just noisier results at a fixed schedule.
+
+**Part 3 re-run twice** (full `N=3–7` after the percentile-scoring fix; then `N=6,7` only
+after the hard-floor fix, via new `vm_benchmark.py --part3 --n=6,7` flags) to reach a
+trustworthy result:
+
+| N | a (final) | RMS |
+|---|---|---|
+| 3 | 2 | 0.199 |
+| 4 | 2 | 0.124 |
+| 5 | 2 | 0.180 |
+| 6 | 2 | 0.191 |
+| 7 | 1.5 | 0.398 |
+
+`N=3–6` now agree cleanly on `a=2` — flat, and now trustworthy given consistent chain
+quality across all four. `N=7` breaks the pattern, but checked directly and found NOT to
+be a repeat of the same bug: its chain has no T1 outlier (all qubits `60–85us`, above
+the chip median). Instead, `N=7`'s logical chain needs 7 required two-qubit edges per
+Trotter step vs `4–6` for `N=3–6` (one more boson qubit → one more bond), which is
+exactly the mechanism above acting through `N` itself rather than through qubit-luck:
+more required gates per step is a larger `B`, predicting both a lower `a` and (via
+`E*∝√(AB)`, D-17) a higher achievable error floor — both observed. This is *consistent
+with* real Trotter-error growth with `N` finally showing up once gate-count growth
+outweighs whatever weaker growth the Trotter-error prefactor `A` has on its own — the
+kind of effect Drew's original question was asking about — but it rests on a single
+data point breaking an otherwise flat trend, so it is a lead, not a confirmed law.
+
+**What's regenerated and what isn't.** `results/VMBenchmark/`: Part 1 (`01`–`04`,
+`L=1,N=5` ablation) and Part 3 (`N3`–`N7` production + `schedule_fit_N*` diagnostics) now
+reflect the final (percentile-scoring + hard-floor) search — confirmed Part 1's chain is
+byte-identical before/after the hard-floor addition (none of its qubits were near the
+floor), so it didn't need a third regeneration. **Part 2 (`05`–`07`, the `L=1→3` sweep at
+`N=5,J=0.1`) was NOT regenerated** — it still reflects the original pre-fix search and
+should be treated as stale if examined closely; not redone here as it wasn't the focus of
+this investigation and its L=3 case alone costs ~3 hours.
+
+**Code changes:** `neuron_circuit.py`'s `find_low_error_qubit_embedding` now does
+multi-start search + percentile-rank scoring (two-qubit CZ error and `1/T1`, combined
+unit-free) + a hard 10th-percentile T1 floor on candidacy. `vm_benchmark.py` gained
+`--part1`/`--part2`/`--part3` (run only specific parts) and `--n=6,7` (restrict Part 3 to
+specific N values) flags for targeted re-runs without repeating already-good, expensive
+work.
+
+**Scope caveat:** the T1 floor (10th percentile) and the percentile-scoring approach are
+both reasonable, checked-to-work-here heuristics, not derived from gate-duration data
+(which would let CZ error and T1 be combined in native, comparable units instead of via
+ranks) — `two_qubit_gates_per_trotter_step`'s docstring already flags this general class
+of "deliberately coarse" tradeoff. If qubit-selection quality becomes load-bearing again,
+that's the more principled fix to reach for.
+
+**Overturned by:** a config/calibration change (re-run `find_low_error_qubit_embedding`'s
+correctness+quality checks per its docstring); or extending the `N` sweep past 7, or
+adding resolution around `N=6–7`, and finding the break doesn't hold up as a clean
+transition — Part B's `N=7` conclusion is explicitly flagged above as a lead, not settled.
+
 **Results and comparison (`notes/first-vs-second-order-trotter-comparison.md`):
 noise sign-flips the answer.** At matched step count (both scripts share D-18/D-19's
 schedule, fitted for first order): **noiseless**, second order wins clearly — RMS error
