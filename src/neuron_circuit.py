@@ -6,6 +6,7 @@ NuronSim.py imports from here; it no longer defines these itself.
 """
 import itertools
 import numpy as np
+import matplotlib.pyplot as plt
 from qutip import basis, tensor, destroy, sesolve, expect, qeye, sigmax, sigmay, sigmaz, fock
 from scipy.optimize import minimize_scalar
 import cirq
@@ -610,6 +611,56 @@ def map_and_compile_for_willow(circuit: cirq.Circuit, source_qubits: list, qubit
     return cirq.optimize_for_target_gateset(mapped_circuit, gateset=target_gateset)
 
 
+def plot_qubit_embedding_overlay(willow_calibration, willow_qubit_chain: list,
+                                  NumberOfFockStates: int, NumberOfBosonicModes: int):
+    """Willow calibration grid (T1 per qubit, two-qubit CZ error per bond -- same layout as
+    src/willow_calibration_grid.py) with the specific qubits and edges THIS run's embedding
+    (find_low_error_qubit_embedding) actually uses highlighted in red on top -- lets the
+    chosen device patch be checked against the chip-wide calibration at a glance, e.g.
+    whether it's hugging a high-T1/low-error region or was forced through a mediocre one.
+
+    used_edges is derived from required_adjacency_edges (the same source-of-truth used by
+    find_low_error_qubit_embedding itself) mapped through willow_qubit_chain, rather than
+    just connecting consecutive chain entries -- correct at NumberOfBosonicModes<=1 (a
+    simple chain) and also at NumberOfBosonicModes>1, where the logical topology is a comb
+    and consecutive LineQubit indices are not all logically adjacent.
+
+    Returns the created Figure; caller saves/shows/closes it (matching NuronSim.py's own
+    figure-handling convention rather than this module doing file I/O)."""
+    used_qubits = list(dict.fromkeys(willow_qubit_chain))  # de-duplicate, preserve order
+    logical_edges = required_adjacency_edges(NumberOfFockStates, NumberOfBosonicModes)
+    used_edges = [(willow_qubit_chain[a.x], willow_qubit_chain[b.x]) for a, b in logical_edges]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 9))
+
+    willow_calibration.heatmap("single_qubit_idle_t1_micros").plot(ax1)
+    ax1.scatter([q.col for q in used_qubits], [q.row for q in used_qubits],
+                s=280, facecolors='none', edgecolors='red', linewidths=2.5, zorder=5)
+
+    two_qubit_error_pct = {
+        willow_calibration.key_to_qubits(key): willow_calibration.value_to_float(value) * 100
+        for key, value in willow_calibration["two_qubit_parallel_cz_gate_xeb_pauli_error_per_cycle"].items()
+    }
+    cirq.TwoQubitInteractionHeatmap(
+        two_qubit_error_pct,
+        title="Two Qubit Parallel Cz Gate Xeb Pauli Error Per Cycle",
+        annotation_format=".2f",
+        annotation_text_kwargs={"fontsize": 7},
+        colorbar_options={"label": "%"},
+    ).plot(ax2)
+    for qa, qb in used_edges:
+        ax2.plot([qa.col, qb.col], [qa.row, qb.row], color='red', linewidth=3.5, zorder=5, solid_capstyle='round')
+    ax2.scatter([q.col for q in used_qubits], [q.row for q in used_qubits],
+                s=45, color='red', zorder=6)
+
+    fig.suptitle(
+        f"willow_pink calibration ({willow_calibration.timestamp_str()}) -- current embedding highlighted",
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
 def build_trotter_circuit(D_list, spin_interaction_coefficient, NumberOfFockStates, NumberOfBosonicModes,
                            dt, NumberOfTrotterSteps, SpinBosonInteractionCoefficent):
     """Builds the full logical circuit (vacuum state prep + NumberOfTrotterSteps repeats
@@ -853,9 +904,13 @@ def sample_shots_with_postselection(sim, compiled_circuit, qubit_chain, NumberOf
     - *_post: identical estimator but restricted to shots where every mode's boson
       register is exactly one-hot (the physical/unary subspace) -- shots that leaked out
       of it (detectable, D-4) are discarded rather than silently averaged in.
+    - *_removed: the complementary estimator, over exactly the shots *_post discards --
+      lets a caller plot what post-selection is actually throwing away, not just what it
+      keeps. NaN (via the same estimate() helper, not a special case) when nothing was
+      removed at a given point (survival_rate == 1.0).
 
-    Returns a dict with occ_raw, mag_raw, occ_post, mag_post (each length-L arrays) and
-    survival_rate (fraction of shots kept by post-selection)."""
+    Returns a dict with occ_raw, mag_raw, occ_post, mag_post, occ_removed, mag_removed
+    (each length-L arrays) and survival_rate (fraction of shots kept by post-selection)."""
     N = NumberOfFockStates
     L = NumberOfBosonicModes
 
@@ -882,9 +937,10 @@ def sample_shots_with_postselection(sim, compiled_circuit, qubit_chain, NumberOf
 
     occ_raw, mag_raw = estimate(np.ones(num_samples, dtype=bool))
     occ_post, mag_post = estimate(valid_mask)
+    occ_removed, mag_removed = estimate(~valid_mask)
 
     return dict(occ_raw=occ_raw, mag_raw=mag_raw, occ_post=occ_post, mag_post=mag_post,
-                survival_rate=survival_rate)
+                occ_removed=occ_removed, mag_removed=mag_removed, survival_rate=survival_rate)
 
 
 # ---------------------------------------------------------------------------

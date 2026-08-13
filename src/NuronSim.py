@@ -12,6 +12,7 @@ from neuron_circuit import (
     compute_observables_from_z_expectations,
     find_low_error_qubit_embedding,
     map_and_compile_for_willow,
+    plot_qubit_embedding_overlay,
     build_trotter_circuit,
     recommended_trotter_steps,
     check_trotter_schedule_config,
@@ -21,6 +22,8 @@ from neuron_circuit import (
     describe_trotter_run,
     TROTTER_SCHEDULE_T_CAP,
 )
+
+RESULTS_DIR = "/Users/drewbackhouse/Documents/Claude/Google Neuron/results"
 
 #------------------------
 # INPUT
@@ -51,7 +54,7 @@ UseAdaptiveTrotterSteps = True
 # trajectory sampling — see D-14). Runtime scales ~linearly with this; shot noise scales
 # ~1/sqrt(it). 2000 matched the exact density-matrix result closely in testing. Use fewer
 # (e.g. 200-500) when testing changes, especially at high NumberOfTrotterSteps.
-NumberOfNoiseSamples = 2000
+NumberOfNoiseSamples = 500
 
 # Set False to run the Cirq sim through Willow's mapping/compilation with the noise model
 # switched off (ideal, ~single-shot exact-ish result — ISOLATES circuit/Trotter-error
@@ -67,6 +70,19 @@ UseNoiseModel = True
 # _raw). Noiseless results are unaffected -- survival rate is exactly 1.0 there (D-18), so
 # post-selected and raw are identical.
 UsePostSelection = True
+
+# Set True to also plot the shots post-selection discarded (unary-leakage detected, D-4)
+# as greyed-out points, alongside the kept/plotted result -- lets you see what's actually
+# being thrown away rather than just the survival-rate number. Only affects the noisy
+# path; no-op when UseNoiseModel=False (nothing is ever discarded there, D-18).
+ShowPostSelectionRemovedPoints = True
+
+# Set True to also produce the willow_pink calibration grid (T1 per qubit, two-qubit CZ
+# error per bond -- src/willow_calibration_grid.py) with this run's chosen qubit embedding
+# (find_low_error_qubit_embedding) highlighted on top, shown alongside the results plot --
+# lets the selected device patch be sanity-checked against the chip-wide calibration
+# (e.g. whether find_low_error_qubit_embedding actually landed on a good-looking region).
+ShowQubitEmbeddingOverlay = True
 
 # Filename tag + human-readable stage description for this configuration (which error
 # sources -- noise, a low fixed Trotter step count -- and which mitigations -- adaptive
@@ -128,7 +144,7 @@ for mode_idx in range(NumberOfBosonicModes):
         ax1.set_ylabel(
             'Average Bosonic Occupation number', color=color_boson, fontweight='bold'
         )
-    ax1.plot(time_data, boson_data, color=color_boson, linestyle='-', linewidth=1.5, label='QuTiP – Bosonic occupation')
+    ax1.plot(time_data, boson_data, color=color_boson, linestyle='-', linewidth=1.5)
 
     # Right Axis: Spin Magnetization
     ax2 = ax1.twinx()
@@ -136,7 +152,7 @@ for mode_idx in range(NumberOfBosonicModes):
     if mode_idx == NumberOfBosonicModes - 1:
         ax2.set_ylabel('Average Spin Magnetisation', color=color_spin, fontweight='bold')
 
-    ax2.plot(time_data, spin_data, color=color_spin, linestyle='-', linewidth=1.5, label='QuTiP – Spin magnetisation')
+    ax2.plot(time_data, spin_data, color=color_spin, linestyle='-', linewidth=1.5)
 
     if NumberOfBosonicModes > 1:
         ax1.set_title(f"Mode {mode_idx}", fontweight='bold', pad=10)
@@ -211,6 +227,11 @@ willow_qubit_chain = find_low_error_qubit_embedding(willow_device, willow_calibr
 print(f"Mapped {total_qubits} logical qubits onto Willow ({processor_id}):")
 print("  " + " - ".join(str(q) for q in willow_qubit_chain))
 
+if ShowQubitEmbeddingOverlay:
+    embedding_fig = plot_qubit_embedding_overlay(willow_calibration, willow_qubit_chain, NumberOfFockStates, NumberOfBosonicModes)
+    embedding_fig.savefig(f"{RESULTS_DIR}/NuronSim_{run_tag}_embedding.png", dpi=150)
+    print(f"Saved {RESULTS_DIR}/NuronSim_{run_tag}_embedding.png")
+
 # qsimcirq trajectory-samples the noise (Monte Carlo unraveling + measurement), the same
 # way real hardware execution works — this needs the GoogleQVM conda env (Python 3.12),
 # where qsimcirq has a working wheel; the project's default macOS .venv doesn't have one
@@ -223,14 +244,13 @@ if not UseNoiseModel:
 if UseAdaptiveTrotterSteps:
     check_trotter_schedule_config(NumberOfBosonicModes, NumberOfFockStates, D_list, spin_interaction_coefficient)
     print("UseAdaptiveTrotterSteps = True — NumberOfTrotterSteps per point from recommended_trotter_steps(t).")
-    # D-17/D-18: cap the sweep at the schedule's noise-budget limit rather than reporting
-    # points that would need more Trotter depth than the noise budget affords (not
-    # Trotter-converged at any reachable step count there — see trotter_schedule_cap_message).
+    # D-17/D-18 cap disabled at Drew's request: sweep now runs to the full requested Time
+    # even past the schedule's noise-budget limit. Points beyond TROTTER_SCHEDULE_T_CAP are
+    # not Trotter-converged at any reachable step count (see trotter_schedule_cap_message) —
+    # the warning below still prints so that's visible, it just no longer truncates the sweep.
     cap_message = trotter_schedule_cap_message(Time)
     if cap_message is not None:
         print(cap_message)
-        print(f"Capping sweep at Time={TROTTER_SCHEDULE_T_CAP:.2f} (was {Time}).")
-        Time = TROTTER_SCHEDULE_T_CAP
 
 # Arrays to store measurements. *_post is the primary result (post-selected on the unary
 # constraint, D-4); *_raw is the uncorrected marginal estimate over all shots, kept for
@@ -239,6 +259,8 @@ bosonic_occupation_results = np.zeros((NumberOfTimeSteps, NumberOfBosonicModes))
 spin_magnetization_results = np.zeros((NumberOfTimeSteps, NumberOfBosonicModes))
 bosonic_occupation_raw = np.zeros((NumberOfTimeSteps, NumberOfBosonicModes))
 spin_magnetization_raw = np.zeros((NumberOfTimeSteps, NumberOfBosonicModes))
+bosonic_occupation_removed = np.full((NumberOfTimeSteps, NumberOfBosonicModes), np.nan)
+spin_magnetization_removed = np.full((NumberOfTimeSteps, NumberOfBosonicModes), np.nan)
 postselection_survival_rate = np.full(NumberOfTimeSteps, np.nan)
 trotter_steps_used = np.zeros(NumberOfTimeSteps, dtype=int)
 
@@ -280,6 +302,8 @@ for time_idx, t in enumerate(time_data):
         spin_magnetization_results[time_idx] = shots['mag_post'] if UsePostSelection else shots['mag_raw']
         bosonic_occupation_raw[time_idx] = shots['occ_raw']
         spin_magnetization_raw[time_idx] = shots['mag_raw']
+        bosonic_occupation_removed[time_idx] = shots['occ_removed']
+        spin_magnetization_removed[time_idx] = shots['mag_removed']
         postselection_survival_rate[time_idx] = shots['survival_rate']
     else:
         z_expectations = [z.real for z in noisy_sim.simulate_expectation_values(compiled_circuit, observables=z_observables)]
@@ -310,17 +334,19 @@ for mode_idx in range(NumberOfBosonicModes):
     boson_data = bosonic_occupation_results[:, mode_idx]
     spin_data = spin_magnetization_results[:, mode_idx]
 
-    if UseNoiseModel:
-        postselected_label = 'Cirq (Willow, noisy, post-selected)' if UsePostSelection else 'Cirq (Willow, noisy, NO post-selection)'
-    else:
-        postselected_label = 'Cirq (Willow, noiseless)'
-    boson_scatter = ax1.scatter(time_data, boson_data, color=color_boson, marker='o', edgecolors='black', linewidths=0.5, alpha=0.8, zorder=5, label=f'{postselected_label} – Bosonic occupation')
-    spin_scatter = ax2.scatter(time_data, spin_data, color=color_spin, marker='s', edgecolors='black', linewidths=0.5, alpha=0.8, zorder=5, label=f'{postselected_label} – Spin magnetisation')
+    if ShowPostSelectionRemovedPoints and UseNoiseModel and UsePostSelection:
+        removed_boson_scatter = ax1.scatter(time_data, bosonic_occupation_removed[:, mode_idx], color='lightgray',
+                                             marker='o', edgecolors='dimgray', linewidths=0.5, alpha=0.6, zorder=3)
+        removed_spin_scatter = ax2.scatter(time_data, spin_magnetization_removed[:, mode_idx], color='lightgray',
+                                            marker='s', edgecolors='dimgray', linewidths=0.5, alpha=0.6, zorder=3)
+        _cirq_overlay_artists.extend([removed_boson_scatter, removed_spin_scatter])
+
+    boson_scatter = ax1.scatter(time_data, boson_data, color=color_boson, marker='o', edgecolors='black', linewidths=0.5, alpha=0.8, zorder=5)
+    spin_scatter = ax2.scatter(time_data, spin_data, color=color_spin, marker='s', edgecolors='black', linewidths=0.5, alpha=0.8, zorder=5)
     _cirq_overlay_artists.extend([boson_scatter, spin_scatter])
 
     if UseAdaptiveTrotterSteps and TROTTER_SCHEDULE_T_CAP < time_data.max():
-        cap_line = ax1.axvline(TROTTER_SCHEDULE_T_CAP, color='gray', linestyle=':', linewidth=1, zorder=1,
-                                label=f'Trotter schedule cap (t={TROTTER_SCHEDULE_T_CAP:.2f})')
+        cap_line = ax1.axvline(TROTTER_SCHEDULE_T_CAP, color='gray', linestyle=':', linewidth=1, zorder=1)
         _cirq_overlay_artists.append(cap_line)
 
     # Mark which NumberOfTrotterSteps value applies to each cluster of points (varies
@@ -343,7 +369,6 @@ if UseNoiseModel:
           f"min={np.nanmin(postselection_survival_rate):.3%}, "
           f"max={np.nanmax(postselection_survival_rate):.3%} over the sweep.")
 
-RESULTS_DIR = "/Users/drewbackhouse/Documents/Claude/Google Neuron/results"
 qutip_fig.savefig(f"{RESULTS_DIR}/NuronSim_{run_tag}.png", dpi=130)
 np.savez(
     f"{RESULTS_DIR}/NuronSim_{run_tag}.npz",
@@ -351,6 +376,7 @@ np.savez(
     qutip_time=times, qutip_occ=exp_n, qutip_mag=exp_sz,
     bosonic_occupation_post=bosonic_occupation_results, spin_magnetization_post=spin_magnetization_results,
     bosonic_occupation_raw=bosonic_occupation_raw, spin_magnetization_raw=spin_magnetization_raw,
+    bosonic_occupation_removed=bosonic_occupation_removed, spin_magnetization_removed=spin_magnetization_removed,
     postselection_survival_rate=postselection_survival_rate,
     D_list=np.array(D_list), NumberOfFockStates=NumberOfFockStates, NumberOfBosonicModes=NumberOfBosonicModes,
     spin_interaction_coefficient=spin_interaction_coefficient, SpinBosonInteractionCoefficent=SpinBosonInteractionCoefficent,
